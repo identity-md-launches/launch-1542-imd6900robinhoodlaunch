@@ -5,7 +5,7 @@ trades at IMD6900's price on Ethereum (read live from its pool).
     python3 script/params.py [--buy 2.81] [--slippage 2]
 
 The locked position holds the whole supply from the opening price down, so it trades like a constant product pool
-with x0 = the opening market cap in ETH and y0 = the supply. A buy of d ETH (after the pool's 1%) moves the market
+with x0 = the opening market cap in ETH and y0 = the supply. A buy of d ETH (fee-free: the hook exempts the launch's own buy) moves the market
 cap to (x0 + d)^2 / x0; this solves for x0 so that lands on Ethereum's price. Prints the launch's sqrtPriceX96, the
 coins the buy lands and the minBought floor.
 """
@@ -16,7 +16,7 @@ PM = "0x000000000004444c5dc75cB358380D2e3dE08A90"
 SLOT0 = "0x7e47497a4b220e6c3be61258e56d7f872887172456bb19561cb09c9f93025f88"  # IMD6900's Ethereum pool, in the PoolManager
 IMD6900_ETH = "0x0000198C940D8cD70Cb9ACeC5E3af8216ac57d2F"
 SUPPLY = 10**9
-FEE = 0.01
+FEE = 0.0  # the hook charges the launch's opening buy nothing
 
 
 def cast(*a):

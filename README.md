@@ -12,7 +12,7 @@ and the old IMDSTR claims the new coin 1:1, up to each holder's snapshot balance
 | `src/IMD6900RobinhoodLaunch.sol` | What the swarm deploys. Its constructor creates the pool and mines the hook's address; it calls nothing that existed before it. Then the launch, the claims, the fee split. |
 | `src/IMD6900.sol` | The coin: 1B minted once to the launch. No owner, no mint, no tax, no pause, no blacklist, no limits, no proxy. Holders can burn their own. |
 | `src/IMD6900LockedPool.sol` | Owns the pool's one position. No owner, no way to take liquidity out. `collect()` (anyone): ETH fees to the split, IMD6900 fees burned. |
-| `src/IMD6900Hook.sol` | ETH / IMD6900 only, initialized once by the locked pool, liquidity from it only; in-pool perps sweep once the timelock wires an engine. No return deltas, no dynamic fee, not upgradeable: Uniswap routes the pool automatically. Owned by the Robinhood timelock. |
+| `src/IMD6900Hook.sol` | ETH / IMD6900 only, initialized once by the locked pool, liquidity from it only. Sets the pool's fee on every swap: 6.9% at the launch, gliding to 4.44% over the first week, then 3.33% (the timelock can lower it, never raise it); the perps engine's own trades and the launch's opening buy pay none. In-pool perps sweep once the timelock wires an engine. No return deltas, not upgradeable. Owned by the Robinhood timelock. |
 
 ## The launch, one transaction
 
@@ -24,10 +24,16 @@ and the old IMDSTR claims the new coin 1:1, up to each holder's snapshot balance
 4. keeps the claims' reserve, and keeps the rest of what it bought in the launch: only the timelock can release it (`releaseExcess`, 12h public delay), so no wallet ever holds it.
 
 The opening price comes from `script/params.py`: chosen so that after the buy the coin trades at IMD6900's Ethereum
-price (2.81 ETH: open at ~19.2 ETH market cap, land at ~25.2, ~126.7M bought). The pool's 1% fee then splits 70% to the
+price (2.81 ETH, fee-free: open at ~19.2 ETH market cap, land at ~25.2, ~127.8M bought). The pool's fee then splits 70% to the
 pot bridge (Ethereum's NFT pot), 10% to $IMD's burn (bought on $IMD's Robinhood pool, sent to IMD's official burn
 executor `0x4D6537ec564aFf82eABb1Ce5f355E817cBEA1e07`, fixed in the code, which bridges it to Base), 20% ops; the
 IMD6900 part is burned. The split is the Robinhood timelock's to change (`setPayees`, 12h public delay).
+
+## Routing
+
+The fee is dynamic (set by the hook per swap), so Uniswap's app and API route the pool once Uniswap has reviewed the
+hook (developers.uniswap.org/hook-allowlist; Programmable's plan opts in to the hook list and Uniswap's API). Until
+then it trades through Programmable, Uniswap's Universal Router (the fork test buys through it) and direct calls.
 
 ## Red flags, and why there are none
 
@@ -41,7 +47,7 @@ swap, so it goes in only behind the delay.
 ## Tests
 
 ```sh
-forge test                                         # 25 tests, offline: admission, launch, pool, fees, $IMD burn, claims
+forge test                                         # 31 tests, offline: admission, launch, pool, fees, $IMD burn, claims
 ROBINHOOD_RPC_URL=https://rpc.mainnet.chain.robinhood.com forge test --match-contract RobinhoodFork -vv
 ```
 

@@ -62,6 +62,13 @@ contract Trader {
     receive() external payable {}
 }
 
+/// A stand-in perps engine: trades like any router, and its sweep finds nothing to liquidate
+contract Engine is Trader {
+    constructor(IPoolManager pm_) Trader(pm_) {}
+    function sweepLiquidations(address, int256, bool, uint160) external pure returns (uint8) { return 0; }
+    function openCount() external pure returns (uint256) { return 0; }
+}
+
 /// Puts full-range liquidity in a plain pool (the stand-in for $IMD's pool on Robinhood)
 contract LiquidityAdder {
     IPoolManager immutable pm; PoolKey key; uint256 liq;
@@ -157,9 +164,10 @@ contract IMD6900RobinhoodLaunchTest is Test {
         _scan(type(IMD6900).creationCode, "coin creation code");
     }
 
-    function test_TheHookIsRoutable() public view {
+    function test_TheHooksAddressAndPermissions() public view {
         assertEq(uint160(address(hook)) & Hooks.ALL_HOOK_MASK, L.FLAGS(), "carries exactly its flags");
-        assertTrue(uint160(address(hook)) >> 152 != 0x91, "not a 0x91 address (Uniswap reviews those by hand)");
+        assertTrue(uint160(address(hook)) >> 152 != 0x91, "not a 0x91 address");
+        assertEq(hook.launcher(), address(L));
         Hooks.Permissions memory p = hook.getHookPermissions();
         assertFalse(p.beforeSwapReturnDelta || p.afterSwapReturnDelta || p.afterAddLiquidityReturnDelta || p.afterRemoveLiquidityReturnDelta);
     }
@@ -177,8 +185,8 @@ contract IMD6900RobinhoodLaunchTest is Test {
         assertEq(t, L.tokenAddress(bytes32(0)));
         assertEq(L.token(), t);
         emit log_named_decimal_uint("opening buy, coins", bought, 18);
-        // constant product from 19.18 ETH: 2.81 ETH less the pool's 1% lands ~12.67%
-        assertApproxEqRel(bought, 126_700_000 ether, 0.01e18);
+        // constant product from 19.18 ETH: 2.81 ETH, fee-free (the hook exempts the launch's own buy), lands ~12.78%
+        assertApproxEqRel(bought, 127_790_000 ether, 0.005e18);
         assertEq(IERC20(t).balanceOf(address(L)), AA + BB + CC, "exactly the claims' reserve stays");
         uint256 burned = L.launchExcess();
         assertEq(IERC20(t).totalSupply(), SUPPLY - burned, "the rest is burned");
@@ -188,7 +196,7 @@ contract IMD6900RobinhoodLaunchTest is Test {
         (uint160 sq,,) = pool.state();
         uint256 mc = FullMath.mulDiv(FullMath.mulDiv(SUPPLY, 1 << 96, sq), 1 << 96, sq); // coins / (coins per ETH)
         emit log_named_decimal_uint("market cap after the buy, ETH on 1B", mc, 18);
-        assertApproxEqRel(mc, 25.15 ether, 0.02e18, "Ethereum's price");
+        assertApproxEqRel(mc, 25.21 ether, 0.01e18, "Ethereum's price");
     }
 
     function test_RefusesTheWrongAddress() public {
@@ -338,7 +346,7 @@ contract IMD6900RobinhoodLaunchTest is Test {
         emit log_named_decimal_uint("pot bridge", toPot, 18);
         emit log_named_decimal_uint("ops", toOps, 18);
         uint256 fees = toPot + toOps + L.imdBucket();
-        assertApproxEqRel(fees, 0.1 ether + BUY / 100, 0.01e18, "1% of the buys, the opening buy's included");
+        assertApproxEqRel(fees, 0.69 ether, 0.001e18, "6.9% of the trader's buy; the opening buy paid none");
         assertApproxEqRel(toPot, fees * 7 / 10, 1e14, "70% the pot");
         assertApproxEqRel(L.imdBucket(), fees / 10, 1e14, "10% set aside for $IMD's burn");
         assertApproxEqRel(toOps, fees * 2 / 10, 1e14, "20% ops");
@@ -390,6 +398,65 @@ contract IMD6900RobinhoodLaunchTest is Test {
         L.harvest();
         assertApproxEqRel(POT.balance - potBefore, (POT.balance - potBefore + L.imdBucket()) * 9 / 10, 1e14, "90 / 10");
         t;
+    }
+
+    /*                                THE FEE                                */
+
+    function test_TheFeesSchedule() public {
+        assertEq(hook.currentFee(), 69_000, "6.9% before the launch: what it opens at");
+        _launch();
+        uint256 t0 = hook.launchedAt(); // not block.timestamp: via-IR may re-read that after a warp
+        assertEq(hook.currentFee(), 69_000, "6.9% at the launch");
+        vm.warp(t0 + 3.5 days);
+        assertEq(hook.currentFee(), 56_700, "halfway down the glide");
+        vm.warp(t0 + 7 days - 1);
+        assertApproxEqAbs(hook.currentFee(), 44_400, 1, "4.44% at the end of the first week");
+        vm.warp(t0 + 7 days);
+        assertEq(hook.currentFee(), 33_300, "3.33% from then on");
+        vm.warp(t0 + 365 days);
+        assertEq(hook.currentFee(), 33_300);
+    }
+
+    function test_TradersPayTheSchedule() public {
+        _launch();
+        uint256 t0 = hook.launchedAt();
+        PoolKey memory k = pool.poolKey();
+        trader.swap(k, true, -1 ether);
+        vm.warp(t0 + 8 days);
+        trader.swap(k, true, -1 ether);
+        (uint256 eth,) = pool.collect();
+        assertApproxEqRel(eth, 0.069 ether + 0.0333 ether, 0.001e18, "6.9% on day one, 3.33% after the first week");
+    }
+
+    function test_OnlyTheTimelockLowersTheFee() public {
+        _launch();
+        vm.prank(OWNER);
+        vm.expectRevert(Ownable.Unauthorized.selector);
+        hook.lowerFee(20_000);
+        vm.prank(TL);
+        hook.lowerFee(20_000);
+        assertEq(hook.currentFee(), 20_000, "the cap under the schedule");
+        vm.prank(TL);
+        vm.expectRevert(IMD6900Hook.InvalidFee.selector);
+        hook.lowerFee(30_000); // never back up
+        vm.warp(block.timestamp + 30 days);
+        assertEq(hook.currentFee(), 20_000, "the cap holds after the glide too");
+    }
+
+    function test_ThePerpsEngineTradesFeeFree() public {
+        _launch();
+        Engine engine = new Engine(PM);
+        vm.deal(address(engine), 10 ether);
+        vm.prank(TL);
+        hook.setPerpEngine(address(engine));
+        assertEq(hook.feeFor(address(engine)), 0);
+        assertEq(hook.feeFor(address(trader)), 69_000);
+        engine.swap(pool.poolKey(), true, -1 ether);
+        (uint256 eth,) = pool.collect();
+        assertEq(eth, 0, "the engine's trade paid nothing");
+        trader.swap(pool.poolKey(), true, -1 ether); // and a trader's swap runs the engine's (empty) sweep
+        (eth,) = pool.collect();
+        assertApproxEqRel(eth, 0.069 ether, 0.001e18);
     }
 
     function test_OnlyTheTimelockRepointsImdsPool() public {

@@ -1,15 +1,27 @@
 {
  "action": "launch.open",
  "input": {
-  "objective": "Deploy IMD6900RobinhoodLaunch (src/IMD6900RobinhoodLaunch.sol) on Robinhood Chain exactly as it is in the repository: one contract, four constructor arguments in this order: 0x35da9c0303507ddf708e87f2568eddf12c47a059 (owner: the team wallet), 0x8366a39CC670B4001A1121B8F6A443A643e40951 (Uniswap v4's PoolManager on Robinhood Chain), 0x0000198C940D8cD70Cb9ACeC5E3af8216ac57d2F (Robinhood's IMDSTR, the old token that claims the new coin 1:1), 0x16D3f65B708883DF042d98E1C7a49B32A33E2A14 (the Robinhood timelock: owns the hook and recovers ETH). Its constructor creates IMD6900LockedPool and mines a CREATE2 salt from its own address until IMD6900Hook's address carries exactly the hook's permission flags and doesn't start with 0x91 (Uniswap routes such hooks automatically), creates the hook there owned by the timelock and wires the pool to it. It calls nothing that existed before it, so it deploys the same on a fresh chain (test_DeploysOnAFreshChain); it fits one transaction (test_FitsOneTransaction, ~5.3M gas); no contract shows CALLCODE, DELEGATECALL or SELFDESTRUCT, creation code included (test_PassesTheAdmissionScan). Later, its owner launches the coin IMD6900 at a 0x6900… address mined for this contract's address (launch(): the coin with CREATE2, the pool opened with the whole 1B supply as coin-only liquidity, locked for good, and the opening buy, in one transaction), through Programmable's custom launch, which binds every component to the exact source: do not change the source, the compiler settings (solc 0.8.26, via-IR, 200 runs, cancun, bytecode_hash none), the constructor, the hook's permissions, the pool's lack of any liquidity removal, the coin's plain ERC20 (no owner, no mint, no tax), the fee split's defaults (70% pot bridge, 10% $IMD bought for IMD's canonical Robinhood burn executor 0x4D6537ec564aFf82eABb1Ce5f355E817cBEA1e07, fixed in the code, 20% ops), the split being the timelock's alone to change (setPayees), or the timelock's role (the hook's owner; it alone recovers ETH, releases the excess, repoints $IMD's pool and sets the split). test/RobinhoodFork.t.sol runs the whole launch on a Robinhood fork when ROBINHOOD_RPC_URL is set (claims, trades, a buy through Uniswap's Universal Router, the fee split, the $IMD burn) and skips otherwise. Everything builds offline (lib/ is vendored; v4-core's PoolManager is used by the tests only).",
+  "objective": "Deploy IMD6900RobinhoodLaunch (src/IMD6900RobinhoodLaunch.sol) on Robinhood Chain exactly as it is in the repository: one contract, four constructor arguments in this order: 0x35da9c0303507ddf708e87f2568eddf12c47a059 (owner: the team wallet), 0x8366a39CC670B4001A1121B8F6A443A643e40951 (Uniswap v4's PoolManager on Robinhood Chain), 0x0000198C940D8cD70Cb9ACeC5E3af8216ac57d2F (Robinhood's IMDSTR, the old token that claims the new coin 1:1), 0x16D3f65B708883DF042d98E1C7a49B32A33E2A14 (the Robinhood timelock: owns the hook and recovers ETH). Its constructor creates IMD6900LockedPool and mines a CREATE2 salt from its own address until IMD6900Hook's address carries exactly the hook's permission flags and doesn't start with 0x91, creates the hook there owned by the timelock and wires the pool to it. The pool's fee is dynamic and the hook's alone: 6.9% at the launch, gliding to 4.44% over the first week, then 3.33% for good (the timelock can lower it, never raise it), nothing for the perps engine's own trades (perps earn their opening fee and funding in the engine, wired later by the timelock) or the launch's opening buy; it is the pool's LP fee set per swap, with no return deltas, accruing to the locked position. It calls nothing that existed before it, so it deploys the same on a fresh chain (test_DeploysOnAFreshChain); it fits one transaction (test_FitsOneTransaction, ~5.3M gas); no contract shows CALLCODE, DELEGATECALL or SELFDESTRUCT, creation code included (test_PassesTheAdmissionScan). Later, its owner launches the coin IMD6900 at a 0x6900\u2026 address mined for this contract's address (launch(): the coin with CREATE2, the pool opened with the whole 1B supply as coin-only liquidity, locked for good, and the opening buy, in one transaction), through Programmable's custom launch, which binds every component to the exact source: do not change the source, the compiler settings (solc 0.8.26, via-IR, 200 runs, cancun, bytecode_hash none), the constructor, the hook's permissions, the fee schedule, the pool's lack of any liquidity removal, the coin's plain ERC20 (no owner, no mint, no tax), the fee split's defaults (70% pot bridge, 10% $IMD bought for IMD's canonical Robinhood burn executor 0x4D6537ec564aFf82eABb1Ce5f355E817cBEA1e07, fixed in the code, 20% ops), the split being the timelock's alone to change (setPayees), or the timelock's role (the hook's owner; it alone recovers ETH, releases the excess, repoints $IMD's pool and sets the split). test/RobinhoodFork.t.sol runs the whole launch on a Robinhood fork when ROBINHOOD_RPC_URL is set (claims, trades, a buy through Uniswap's Universal Router, the fee split, the $IMD burn) and skips otherwise. Everything builds offline (lib/ is vendored; v4-core's PoolManager is used by the tests only).",
   "repoUrl": "https://github.com/magic0xfrens/imd6900-rh-launch.git",
   "baseCommit": "<the pushed commit>",
-  "contracts": ["IMD6900RobinhoodLaunch"],
+  "contracts": [
+   "IMD6900RobinhoodLaunch"
+  ],
   "onchain": "evm_contracts",
   "chainId": 4663,
   "owner": "0x35da9c0303507ddf708e87f2568eddf12c47a059",
   "github": true,
   "shape": "chain",
-  "steps": [{"skill": "audit-imported-code"}, {"skill": "adapt-contract-project"}, {"skill": "adversarial-review"}]
+  "steps": [
+   {
+    "skill": "audit-imported-code"
+   },
+   {
+    "skill": "adapt-contract-project"
+   },
+   {
+    "skill": "adversarial-review"
+   }
+  ]
  }
 }

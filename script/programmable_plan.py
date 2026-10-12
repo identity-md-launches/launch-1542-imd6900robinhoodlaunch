@@ -23,7 +23,7 @@ TEAM = "0x35dA9C0303507ddf708E87F2568EdDf12c47a059"
 PM = "0x8366a39CC670B4001A1121B8F6A443A643e40951"
 IMDSTR = "0x0000198C940D8cD70Cb9ACeC5E3af8216ac57d2F"
 TIMELOCK = "0x16D3f65B708883DF042d98E1C7a49B32A33E2A14"
-POOL_FEE, TICK_SPACING = 10_000, 60
+POOL_FEE, TICK_SPACING = 0x800000, 60  # a dynamic fee: the hook sets it per swap
 # beforeInitialize, beforeAddLiquidity, beforeRemoveLiquidity, beforeSwap, afterSwap (manifest hookPermissionBits)
 PERMISSIONS = (1 << 13) | (1 << 11) | (1 << 9) | (1 << 7) | (1 << 6)
 CALLBACKS = ("beforeInitialize", "beforeAddLiquidity", "beforeRemoveLiquidity", "beforeSwap", "afterSwap")
@@ -34,7 +34,7 @@ IMMUTABLES = {
     "IMD6900RobinhoodLaunch": [("poolManager", "address"), ("pool", "@pool"), ("hook", "@hook"), ("hookSalt", "bytes32"),
                                ("imdstr", "address"), ("timelock", "address")],
     "IMD6900LockedPool": [("poolManager", "address"), ("poolFee", "uint24"), ("launcher", "@launch")],
-    "IMD6900Hook": [("poolManager", "address"), ("pool", "@pool"), ("poolFeePips", "uint24")],
+    "IMD6900Hook": [("poolManager", "address"), ("pool", "@pool"), ("launcher", "@launch")],
     "IMD6900": [],
 }
 
@@ -134,7 +134,7 @@ def main():
     ctor = {
         "launch": enc("f(address,address,address,address)", TEAM, PM, IMDSTR, TIMELOCK),
         "pool": enc("f(address,uint24,address)", PM, str(POOL_FEE), L),
-        "hook": enc("f(address,address,address,uint24)", PM, pool, TIMELOCK, str(POOL_FEE)),
+        "hook": enc("f(address,address,address)", PM, pool, TIMELOCK),
         "imd6900": enc("f(address)", L),
     }
     names = {"launch": "IMD6900RobinhoodLaunch", "pool": "IMD6900LockedPool", "hook": "IMD6900Hook", "imd6900": "IMD6900"}
@@ -194,7 +194,7 @@ def main():
         "publication": {"visibility": "listed", "name": "Identity.MD 6900", "symbol": "IMD6900",
                         "description": "Identity.MD 6900 on Robinhood Chain: the identity.md machine strategy, the meme branch of the IMD swarm. "
                                        "Launched by the IMD swarm: the whole supply in a locked Uniswap v4 pool with in-pool perps to come, "
-                                       "70% of its fees to Ethereum's NFT pot, 10% to $IMD's burn.",
+                                       "its fee 6.9% gliding to 4.44% over the first week, then 3.33%: 70% to Ethereum's NFT pot, 10% to $IMD's burn.",
                         "imageUrl": "https://imd6900.pages.dev/logo.png", "primaryComponentId": "imd6900", "primaryMarketId": "imd6900-eth",
                         "links": ["https://x.com/IMD6900", "https://imd6900.pages.dev"]},
     }

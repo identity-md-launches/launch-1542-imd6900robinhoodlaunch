@@ -19,7 +19,7 @@ import {IMD6900LockedPool} from "./IMD6900LockedPool.sol";
 /// @title IMD6900RobinhoodLaunch - Identity.MD 6900 (IMD6900) on Robinhood Chain: the coin, its locked Uniswap v4 pool
 ///        with the perps hook, the opening buy, the 1:1 claim for the old IMDSTR, the fee split
 /// @notice Deployed by the IMD swarm. Its constructor creates the locked pool and the hook (at an address it mines to
-///         carry exactly the hook's permissions, never 0x91…, so Uniswap routes the pool on its own) and calls nothing
+///         carry exactly the hook's permissions, never 0x91…) and calls nothing
 ///         that existed before it. Then:
 ///          1. the team sends the opening buy's ETH (or sends it with {launch}); {withdrawEth} takes it back until then;
 ///          2. the owner sets the claim list ({setClaims}: a Merkle root of the snapshot's IMDSTR balances) and mines
@@ -30,19 +30,20 @@ import {IMD6900LockedPool} from "./IMD6900LockedPool.sol";
 ///             Robinhood timelock can release it: {releaseExcess}), or burned, or sent where the launch says.
 ///         Claims: IMDSTR in, IMD6900 out, 1:1, up to each holder's snapshot balance. IMDSTR moves only to and from
 ///         Robinhood distributors, so claiming opens once the Robinhood timelock makes this contract one.
-///         Fees: the pool's 1% accrues to its locked position. {harvest} (anyone) collects it (the IMD6900 part is
+///         Fees: the pool's fee (its hook's schedule: 6.9% gliding to 4.44% over the first week, then 3.33%) accrues
+///         to its locked position. {harvest} (anyone) collects it (the IMD6900 part is
 ///         burned by the pool) and splits the ETH: 70% to the pot bridge (Ethereum's NFT pot), 10% to $IMD's burn,
 ///         20% ops, until the Robinhood timelock sets other payees ({setPayees}, behind its delay). The $IMD share is kept here and {burnImd} (anyone) spends it,
 ///         at most {IMD_BUY_MAX} a call, buying $IMD on its Robinhood pool for IMD's official burn executor there,
 ///         which bridges it to Base to be destroyed. After the launch, ETH leaves only through the split, the $IMD
 ///         buys, or the timelock's {recoverEth}.
 contract IMD6900RobinhoodLaunch is Ownable, ReentrancyGuard {
-    /// @dev beforeInitialize, beforeAddLiquidity, beforeRemoveLiquidity, beforeSwap, afterSwap: no return deltas, no
-    ///      dynamic fee, nothing that would cost the pool Uniswap's automatic routing
+    /// @dev beforeInitialize, beforeAddLiquidity, beforeRemoveLiquidity, beforeSwap, afterSwap: no return deltas
     uint160 public constant FLAGS = Hooks.BEFORE_INITIALIZE_FLAG | Hooks.BEFORE_ADD_LIQUIDITY_FLAG
         | Hooks.BEFORE_REMOVE_LIQUIDITY_FLAG | Hooks.BEFORE_SWAP_FLAG | Hooks.AFTER_SWAP_FLAG;
-    /// @notice The pool's static fee, hundredths of a bip: 1%
-    uint24 public constant POOL_FEE = 10_000;
+    /// @notice The pool's fee is dynamic: its hook sets it on every swap (6.9% gliding to 4.44% over the first week,
+    ///         then 3.33%; nothing for the perps engine or the opening buy)
+    uint24 public constant POOL_FEE = 0x800000; // LPFeeLibrary.DYNAMIC_FEE_FLAG
     uint256 public constant SUPPLY = 1_000_000_000 ether;
     /// @notice PonsPotBridge on Robinhood: bridges ETH (Across) to the Ethereum launch hook, which feeds IMD6900's NFT pot
     address public constant POT_BRIDGE = 0xc39e650a24985C2bBA9FD83C81041B8f3E3f9EDd;
@@ -143,7 +144,7 @@ contract IMD6900RobinhoodLaunch is Ownable, ReentrancyGuard {
         timelock = timelock_;
         IMD6900LockedPool p = new IMD6900LockedPool(poolManager_, POOL_FEE, address(this));
         bytes memory init =
-            abi.encodePacked(type(IMD6900Hook).creationCode, abi.encode(poolManager_, address(p), timelock_, POOL_FEE));
+            abi.encodePacked(type(IMD6900Hook).creationCode, abi.encode(poolManager_, address(p), timelock_));
         bytes32 s = _mine(keccak256(init));
         address h;
         assembly ("memory-safe") {
