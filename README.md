@@ -9,7 +9,7 @@ and the old IMDSTR claims the new coin 1:1, up to each holder's snapshot balance
 
 | | |
 |---|---|
-| `src/IMD6900RobinhoodLaunch.sol` | What the swarm deploys. Its constructor creates the locked pool and calls nothing that existed before it (~6.0M gas, the same from any deployer). `createHook(salt)` (anyone, once) then creates the hook at a salt mined off-chain for its address. Then the launch, the claims, the fee split. |
+| `src/IMD6900RobinhoodLaunch.sol` | What the swarm deploys. Its constructor creates the locked pool and calls nothing that existed before it (~6.2M gas, the same from any deployer). `createHook(salt)` (anyone, once) then creates the hook at a salt mined off-chain for its address. Then the launch, the claims, the fee split. |
 | `src/IMD6900.sol` | The coin: 1B minted once to the launch. No owner, no mint, no tax, no pause, no blacklist, no limits, no proxy. Holders can burn their own. |
 | `src/IMD6900LockedPool.sol` | Owns the pool's one position. No owner, no way to take liquidity out. `collect()` (anyone): ETH fees to the split, IMD6900 fees burned. `lowerFee(fee)` (the timelock only, lower only): moves the position, in one transaction, into a new pool at the lower fee and the same price. |
 | `src/IMD6900Hook.sol` | ETH / IMD6900 only, at the locked pool's static fee, initialized by the locked pool only (at the launch, and at each lower fee it moves to), liquidity from it only. Charges nothing itself: no dynamic fee, no return deltas. In-pool perps sweep once the timelock wires an engine. Not upgradeable. Owned by the Robinhood timelock. |
@@ -21,7 +21,7 @@ and the old IMDSTR claims the new coin 1:1, up to each holder's snapshot balance
 1. creates IMD6900 with CREATE2 from the launch (reverts unless it lands at `expectedToken`, the mined 0x6900… address);
 2. opens the pool at `sqrtPriceX96` with all 1B as IMD6900-only liquidity from that price down: no ETH needed, locked;
 3. buys first with every wei the launch holds (nobody can trade before: the coin didn't exist a moment earlier);
-4. keeps the claims' reserve, and keeps the rest of what it bought in the launch: only the timelock can release it (`releaseExcess`, 12h public delay), so no wallet ever holds it.
+4. keeps the claims' reserve, and keeps the rest of what it bought in the launch: only the timelock moves it (`sellHeld`, `releaseExcess`, 12h public delay), so no wallet ever holds it.
 
 The opening price and the buy come from `script/params.py`, so that after the buy the coin trades at exactly IMD6900's
 Ethereum price: the pool opens on a tick (0.6% apart), so it rounds the opening onto one and sizes the buy to land on
@@ -40,6 +40,17 @@ ETH / IMD6900 pool at `newFee` at the current price, and moves the whole positio
 but the old pool's earned fees (to the split, like any `collect`); the old pool is left empty and its swaps revert; the
 new one is routable the same way (the fork test buys through the Universal Router before and after a move to 3.33%).
 
+## The opening buy's ETH, back if wanted
+
+Before the launch the ETH never leaves the team wallet (`withdrawEth` returns anything sent early). After it, the ETH
+sits in the pool against the coins the buy landed, and the launch holds those coins. The timelock (12h public delay)
+can sell them back into the pool, ETH to any address (`sellHeld(amount, minEth, to)`), and can end the claims early
+(`endClaims()`: the unclaimed reserve joins what it can sell; holders see it 12h ahead and can claim first; what they
+claimed is theirs). Selling everything right after the launch returns the buy less 4.44% each way, plus the buy's fee
+through the split: on a fork, 2.54 ETH for the 2.77 spent, ~93% of the 2.81 with the split's ops share (~96% with the
+split pointed at the team); the excess alone, claims kept, ~1.3 ETH. Later, it depends on the price the market left.
+`script/launch.sh recover` (`END_CLAIMS=1` for the reserve too) queues it, `recover-exec` runs it.
+
 ## The liquidity: locked, its fees not
 
 The position belongs to `IMD6900LockedPool`, which has no owner and no function that takes liquidity out to anyone:
@@ -51,19 +62,20 @@ Plain coin (nothing anyone can change), the liquidity locked by construction (no
 upgradeable and owned by the 12h timelock, the opening buy in the same transaction as the pool (no snipe window), the
 bought coins in a contract (the claims' reserve) or burned, never in a wallet. Owner powers left on the launch: the
 claim list before the launch, releasing the unclaimed reserve after the claim deadline (≥ 90 days), the
-IMDSTR the claims collected. The hook's owner (the timelock) wires the perps engine: an engine is called before every
-swap, so it goes in only behind the delay.
+IMDSTR the claims collected. The timelock (12h, public) wires the perps engine (an engine is called before every swap,
+so it goes in only behind the delay), lowers the fee, sets the split, and can sell the coins the launch holds back for
+the opening buy's ETH or end the claims early: each visible 12h before it runs.
 
 ## Tests
 
 ```sh
-forge test                                         # 32 tests, offline: admission, launch, pool, fees, the fee's move, $IMD burn, claims
+forge test                                         # 35 tests, offline: admission, launch, pool, fees, the fee's move, $IMD burn, claims, the ETH back
 ROBINHOOD_RPC_URL=https://rpc.mainnet.chain.robinhood.com forge test --match-contract RobinhoodFork -vv
 ```
 
 The fork test runs the whole thing on live Robinhood state: the real PoolManager, IMDSTR (claims after the timelock's
-distributor op), the pot bridge, $IMD's pool and burn executor, buys through Uniswap's Universal Router, and a move to
-a 3.33% pool.
+distributor op), the pot bridge, $IMD's pool and burn executor, buys through Uniswap's Universal Router, a move to
+a 3.33% pool, and the timelock selling everything held back for ETH.
 
 ## Runbook: `script/launch.sh`
 

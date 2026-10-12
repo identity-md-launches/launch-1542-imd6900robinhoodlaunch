@@ -108,13 +108,13 @@ contract RobinhoodForkTest is Test {
         address expected = L.tokenAddress(bytes32(0));
         uint160 sp = uint160(_sqrt(FullMath.mulDiv(SUPPLY, 1 << 192, 19.40 ether)));
         vm.prank(TEAM);
-        (address t, uint256 bought) = L.launch{value: 2.81 ether}(bytes32(0), expected, sp, 0, address(0));
+        (address t, uint256 bought) = L.launch{value: 2.81 ether}(bytes32(0), expected, sp, 0, address(L)); // as launch.sh: the excess kept
         emit log_named_decimal_uint("opening buy, coins", bought, 18);
         IMD6900LockedPool pool = L.pool();
         uint128 locked = pool.liquidity();
         (uint160 sq,,) = pool.state();
         emit log_named_decimal_uint("market cap after it, ETH on 1B", FullMath.mulDiv(FullMath.mulDiv(SUPPLY, 1 << 96, sq), 1 << 96, sq), 18);
-        assertEq(IERC20(t).balanceOf(address(L)), b1 + b2);
+        assertEq(IERC20(t).balanceOf(address(L)), b1 + b2 + L.excessHeld(), "the claims' reserve and the excess, both here");
 
         // claims open with the timelock's op, as on the day
         vm.prank(TL);
@@ -183,6 +183,18 @@ contract RobinhoodForkTest is Test {
         tr.swap(k, true, -0.1 ether);
         L.harvest();
         assertGt(POT.balance, potBefore2, "the new pool's fees reach the pot");
+
+        // and the opening buy's ETH back, if the team wants it: the timelock ends the claims (H2 never claimed) and
+        // sells everything the launch holds back into the pool (after the trades above moved the price)
+        uint256 teamBefore2 = TEAM.balance;
+        vm.prank(TL);
+        L.endClaims();
+        vm.prank(TL);
+        uint256 back = L.sellHeld(0, 0, TEAM);
+        emit log_named_decimal_uint("sold back to the team, ETH", back, 18);
+        assertEq(TEAM.balance - teamBefore2, back);
+        assertGt(back, 2 ether, "most of the 2.81");
+        assertEq(L.excessHeld(), 0);
     }
 
     /// @dev V4_SWAP (SWAP_EXACT_IN_SINGLE, SETTLE_ALL, TAKE_ALL), ETH in

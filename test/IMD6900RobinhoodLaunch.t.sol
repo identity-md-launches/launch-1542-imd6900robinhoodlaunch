@@ -124,6 +124,7 @@ contract IMD6900RobinhoodLaunchTest is Test {
     address constant A = address(0xA);
     address constant B = address(0xB);
     address constant C = address(0xC);
+    address constant R = address(0x2E7);
     uint256 constant AA = 40_000_000 ether;
     uint256 constant BB = 20_000_000 ether;
     uint256 constant CC = 3_935_747 ether;
@@ -563,6 +564,82 @@ contract IMD6900RobinhoodLaunchTest is Test {
         vm.stopPrank();
     }
 
+    /*                        THE OPENING BUY'S ETH, BACK                     */
+
+    function test_TheTimelockSellsTheExcessBack() public {
+        (address t,) = _launchHeld();
+        uint256 held = L.excessHeld();
+        assertGt(held, 0);
+        vm.prank(OWNER);
+        vm.expectRevert(IMD6900RobinhoodLaunch.NotTimelock.selector);
+        L.sellHeld(0, 0, OWNER);
+        vm.prank(TL);
+        vm.expectPartialRevert(IMD6900RobinhoodLaunch.Short.selector);
+        L.sellHeld(0, BUY, R); // the floor holds
+        vm.prank(TL);
+        uint256 eth = L.sellHeld(0, 0, R);
+        emit log_named_decimal_uint("the excess alone, sold back: ETH", eth, 18);
+        assertEq(R.balance, eth);
+        assertEq(L.excessHeld(), 0);
+        assertEq(IERC20(t).balanceOf(address(L)), AA + BB + CC, "the claims' reserve untouched");
+        vm.prank(TL);
+        vm.expectRevert(IMD6900RobinhoodLaunch.ZeroAmount.selector);
+        L.sellHeld(0, 0, R);
+    }
+
+    function test_EndingTheClaimsBringsMostOfTheBuyBack() public {
+        (address t,) = _launchHeld();
+        vm.startPrank(C); // a holder who claimed keeps it
+        imdstr.approve(address(L), CC);
+        L.claim(CC, CC, _proof(2));
+        vm.stopPrank();
+        vm.prank(OWNER);
+        vm.expectRevert(IMD6900RobinhoodLaunch.NotTimelock.selector);
+        L.endClaims();
+        vm.prank(TL);
+        L.endClaims();
+        assertEq(L.claimReserve(), 0);
+        assertEq(L.excessHeld(), IERC20(t).balanceOf(address(L)), "everything held is the timelock's to sell");
+        vm.startPrank(A);
+        imdstr.approve(address(L), AA);
+        bytes32[] memory pa = _proof(0);
+        vm.expectRevert(IMD6900RobinhoodLaunch.AlreadyReleased.selector);
+        L.claim(AA, AA, pa);
+        vm.stopPrank();
+        vm.prank(TL);
+        vm.expectRevert(IMD6900RobinhoodLaunch.AlreadyReleased.selector);
+        L.endClaims();
+        // the split's ETH to the team too, then everything held sold back
+        address[] memory to = new address[](1);
+        uint16[] memory bps = new uint16[](1);
+        (to[0], bps[0]) = (R, 10_000);
+        vm.prank(TL);
+        L.setPayees(to, bps);
+        vm.prank(TL);
+        L.sellHeld(0, 0, R);
+        L.harvest();
+        emit log_named_decimal_uint("back of the 2.81 ETH buy (C's claim kept by C)", R.balance, 18);
+        assertGe(R.balance, BUY * 90 / 100, "most of it");
+        assertEq(IERC20(t).balanceOf(address(L)), 0);
+    }
+
+    function test_NoClaimsAllOfItBack() public {
+        (address t,) = _launchHeld();
+        vm.prank(TL);
+        L.endClaims();
+        address[] memory to = new address[](1);
+        uint16[] memory bps = new uint16[](1);
+        (to[0], bps[0]) = (R, 10_000);
+        vm.prank(TL);
+        L.setPayees(to, bps);
+        vm.prank(TL);
+        L.sellHeld(0, 0, R);
+        L.harvest();
+        emit log_named_decimal_uint("back of the 2.81 ETH buy, nobody claimed", R.balance, 18);
+        assertGe(R.balance, BUY * 95 / 100, "all of it but the sell's 4.44%");
+        assertLe(IERC20(t).balanceOf(address(L)), 1e18, "dust");
+    }
+
     /*                         OWNER AND TIMELOCK                           */
 
     function test_OnlyTheTimelockRecoversEth() public {
@@ -604,11 +681,20 @@ contract IMD6900RobinhoodLaunchTest is Test {
     /*                               HELPERS                                */
 
     function _launch() internal returns (address t, uint256 bought) {
+        return _launch(address(0));
+    }
+
+    /// @dev As script/launch.sh launches (both ways): the excess kept here for the timelock
+    function _launchHeld() internal returns (address t, uint256 bought) {
+        return _launch(address(L));
+    }
+
+    function _launch(address excessTo) internal returns (address t, uint256 bought) {
         _claims();
         vm.deal(OWNER, BUY);
         address expected_ = L.tokenAddress(bytes32(0));
         vm.prank(OWNER);
-        (t, bought) = L.launch{value: BUY}(bytes32(0), expected_, _sqrtPrice(OPEN_MC), 0, address(0));
+        (t, bought) = L.launch{value: BUY}(bytes32(0), expected_, _sqrtPrice(OPEN_MC), 0, excessTo);
     }
 
     function _claims() internal {

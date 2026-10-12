@@ -16,6 +16,9 @@
 #   script/launch.sh programmable  the Programmable plan for the same launch(): built, packed and preflighted
 #   script/launch.sh submit        creates it on Programmable (their manual review starts), then `review` polls it
 #   script/launch.sh review        the plan's state on Programmable
+#   script/launch.sh recover       after the launch, the opening buy's ETH back: queues on the timelock the sale of the coins
+#                                  the launch holds (END_CLAIMS=1: the unclaimed reserve too, claims end) to the team wallet
+#   script/launch.sh recover-exec  runs it once the 12h delay is over
 #
 # Signs with the imdstr-deployer keystore (the team wallet); SIGN_ARGS="--unlocked --from <team>" on a fork.
 set -euo pipefail
@@ -157,5 +160,37 @@ import json; d=json.load(open('submitted.json')); print(json.dumps({k: d.get(k) 
     python3 -c "
 import json; d=json.load(open('review.json')); print(json.dumps({k: d.get(k) for k in ('status','manualReview','walletUrl','continuation')}, indent=1)[:2000])"
     ;;
-  *) sed -n 2,19p "$0"; exit 1 ;;
+  recover)
+    need LAUNCH deploy
+    [ "$(c $LAUNCH 'token()(address)')" != 0x0000000000000000000000000000000000000000 ] || { echo "not launched: the ETH is the team wallet's (withdrawEth if it was sent)"; exit 1; }
+    HELD=$(c $LAUNCH 'excessHeld()(uint256)'); RESERVE=$(c $LAUNCH 'claimReserve()(uint256)')
+    TARGETS="[$LAUNCH]"
+    AMOUNT=$HELD
+    if [ "${END_CLAIMS:-0}" = 1 ] && [ "$RESERVE" != 0 ]; then AMOUNT=$(python3 -c "print($HELD + $RESERVE)"); fi
+    # the sale's quote at today's price (the position's one range, so a constant product): the floor under it is
+    # SLIPPAGE percent (default 5: the price moves in 12h; MIN_ETH sets it outright)
+    read -r SQ _ LIQ < <(cast call $(c $LAUNCH 'pool()(address)') 'state()(uint160,int24,uint128)' --rpc-url "$RPC" | awk '{print $1}' | xargs)
+    FEE=$(c $(c $LAUNCH 'pool()(address)') 'fee()(uint24)')
+    QUOTE=$(python3 -c "
+q=2**96; sq,l,dy=$SQ,$LIQ,$AMOUNT*(1-$FEE/1e6); sq2=sq+dy*q/l; print(int(l*q*(sq2-sq)/(sq*sq2)))")
+    MIN=${MIN_ETH:-$(python3 -c "print(int($QUOTE*(100-${SLIPPAGE:-5})/100))")}
+    DATAS="[$(cast calldata 'sellHeld(uint256,uint256,address)' 0 $MIN $TEAM)]"
+    if [ "${END_CLAIMS:-0}" = 1 ] && [ "$RESERVE" != 0 ]; then
+      TARGETS="[$LAUNCH,$LAUNCH]"; DATAS="[$(cast calldata 'endClaims()'),$(cast calldata 'sellHeld(uint256,uint256,address)' 0 $MIN $TEAM)]"
+    fi
+    SALT=$(cast keccak "imd6900-rh-recover-$(date +%s)")
+    tx $TL 'scheduleBatch(address[],uint256[],bytes[],bytes32,bytes32,uint256)' "$TARGETS" "$(echo "$TARGETS" | sed -E 's/0x[0-9a-fA-F]{40}/0/g')" "$DATAS" $ZERO $SALT 43200
+    save RECOVER_TARGETS "$TARGETS"; save RECOVER_DATAS "$DATAS"; save RECOVER_SALT "$SALT"
+    echo "queued: sell $(m $AMOUNT) back for ~$(e $QUOTE) ETH today (floor $(e $MIN)) to the team wallet$([ "${END_CLAIMS:-0}" = 1 ] && echo ', claims ended first'); recover-exec in 12h"
+    ;;
+  recover-exec)
+    need RECOVER_SALT recover
+    VALUES=$(echo "$RECOVER_TARGETS" | sed -E 's/0x[0-9a-fA-F]{40}/0/g')
+    OP=$(c $TL 'hashOperationBatch(address[],uint256[],bytes[],bytes32,bytes32)(bytes32)' "$RECOVER_TARGETS" "$VALUES" "$RECOVER_DATAS" $ZERO $RECOVER_SALT)
+    [ "$(c $TL 'isOperationReady(bytes32)(bool)' $OP)" = true ] || { echo "not ready yet"; exit 1; }
+    B0=$(cast balance $TEAM --rpc-url "$RPC")
+    tx $TL 'executeBatch(address[],uint256[],bytes[],bytes32,bytes32)' "$RECOVER_TARGETS" "$VALUES" "$RECOVER_DATAS" $ZERO $RECOVER_SALT
+    echo "back to the team wallet: $(e $(python3 -c "print($(cast balance $TEAM --rpc-url "$RPC") - $B0)")) ETH (less its gas)"
+    ;;
+  *) sed -n 2,22p "$0"; exit 1 ;;
 esac

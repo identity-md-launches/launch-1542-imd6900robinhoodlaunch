@@ -23,7 +23,8 @@ import {IMD6900LockedPool} from "./IMD6900LockedPool.sol";
 ///          0. {createHook} (anyone, once): the hook, with CREATE2 from here, at a salt mined off-chain for this
 ///             contract's address so the hook's address carries exactly its permissions (never 0x91…, so Uniswap
 ///             routes the pool on its own). Every salt it accepts makes the same hook: same code, permissions, owner;
-///          1. the team sends the opening buy's ETH (or sends it with {launch}); {withdrawEth} takes it back until then;
+///          1. the team sends the opening buy's ETH (or sends it with {launch}); {withdrawEth} takes it back until then
+///             (after it, the timelock can sell the coins held here back into the pool for it: {sellHeld});
 ///          2. the owner sets the claim list ({setClaims}: a Merkle root of the snapshot's IMDSTR balances) and mines
 ///             the coin's vanity address for THIS contract (it deploys the coin with CREATE2);
 ///          3. {launch}, one transaction, so nobody trades before it: the coin (1B, minted here), the pool opened with
@@ -69,7 +70,8 @@ contract IMD6900RobinhoodLaunch is Ownable, ReentrancyGuard {
     bytes32 public hookSalt;
     /// @notice Robinhood's IMDSTR, the old token that claims IMD6900 1:1
     address public immutable imdstr;
-    /// @notice The Robinhood timelock: owns the hook, and is the one way ETH leaves after the launch besides the split
+    /// @notice The Robinhood timelock: owns the hook; after the launch it alone moves the coins held here (selling them
+    ///         back for the opening buy's ETH, {sellHeld}), ends the claims early, and recovers ETH besides the split
     address public immutable timelock;
 
     /// @notice IMD6900, once launched
@@ -78,7 +80,8 @@ contract IMD6900RobinhoodLaunch is Ownable, ReentrancyGuard {
     uint256 public launchBought;
     /// @notice What the opening buy landed beyond the claims' reserve: kept here, burned, or sent where the launch said
     uint256 public launchExcess;
-    /// @notice The part of it still held here: only the Robinhood timelock moves it ({releaseExcess})
+    /// @notice The coins held here for the Robinhood timelock (the excess, and the unclaimed reserve once it ends the
+    ///         claims): only it moves them, sold back into the pool ({sellHeld}) or released ({releaseExcess})
     uint256 public excessHeld;
 
     /// @notice The claim list: a Merkle root of (account, IMDSTR balance) at the snapshot, their sum, and when the
@@ -116,6 +119,8 @@ contract IMD6900RobinhoodLaunch is Ownable, ReentrancyGuard {
     event PayeesSet(address[] payees, uint16[] shares);
     event EthRecovered(address to, uint256 amount);
     event ExcessReleased(address to, uint256 amount);
+    event ClaimsEnded(uint256 unclaimed);
+    event HeldSold(uint256 coins, uint256 eth, address to);
     event ImdBurned(uint256 ethIn, uint256 imd);
     event ImdPoolSet(uint24 fee, int24 tickSpacing, address hooks);
 
@@ -338,6 +343,35 @@ contract IMD6900RobinhoodLaunch is Ownable, ReentrancyGuard {
         emit ExcessReleased(to, amount);
     }
 
+    /// @notice Ends the claims now: the unclaimed reserve joins the coins held for the timelock ({sellHeld},
+    ///         {releaseExcess}). Behind its public delay, so every holder sees it coming and can claim before it runs.
+    function endClaims() external {
+        if (msg.sender != timelock) revert NotTimelock();
+        if (token == address(0)) revert NotLaunched();
+        if (unclaimedReleased) revert AlreadyReleased();
+        uint256 unclaimed = claimTotal - claimedTotal;
+        unclaimedReleased = true;
+        claimDeadline = block.timestamp;
+        excessHeld += unclaimed;
+        emit ClaimsEnded(unclaimed);
+    }
+
+    /// @notice Sells `amount` (all of it with 0) of the coins held for the timelock back into the pool, the ETH to
+    ///         `to`: how the opening buy's ETH comes back (all of it but the pool's fee both ways, at the price the
+    ///         market left; the buy's fee comes back through the split). Behind the timelock's delay; `minEth` is the
+    ///         floor. What the pool can't take stays held.
+    function sellHeld(uint256 amount, uint256 minEth, address to) external nonReentrant returns (uint256 eth) {
+        if (msg.sender != timelock) revert NotTimelock();
+        if (amount == 0) amount = excessHeld;
+        if (amount == 0 || amount > excessHeld) revert ZeroAmount();
+        uint256 sold;
+        (eth, sold) = abi.decode(poolManager.unlock(abi.encode(uint8(2), amount)), (uint256, uint256));
+        if (eth < minEth) revert Short(eth);
+        excessHeld -= sold;
+        SafeTransferLib.safeTransferETH(to, eth);
+        emit HeldSold(sold, eth, to);
+    }
+
     /// @notice Repoints $IMD's buys to another of its Robinhood pools (ETH / $IMD), behind the timelock's delay
     function setImdPool(uint24 fee, int24 tickSpacing, address hooks) external {
         if (msg.sender != timelock) revert NotTimelock();
@@ -412,10 +446,21 @@ contract IMD6900RobinhoodLaunch is Ownable, ReentrancyGuard {
     /*                            POOL MANAGER                              */
 
     /// @dev A buy, ETH in, the other side out, as far as the price goes: the opening buy (0) on the coin's pool, or
-    ///      $IMD's burn (1) on its pool
+    ///      $IMD's burn (1) on its pool; or (2) the timelock's sale of held coins on the coin's pool
     function unlockCallback(bytes calldata data) external returns (bytes memory) {
         if (msg.sender != address(poolManager)) revert OnlyPoolManager();
         (uint8 what, uint256 spend) = abi.decode(data, (uint8, uint256));
+        if (what == 2) {
+            PoolKey memory k = pool.poolKey();
+            BalanceDelta s = poolManager.swap(k, SwapParams(false, -int256(spend), TickMath.MAX_SQRT_PRICE - 1), "");
+            uint256 sold = uint256(uint128(-s.amount1()));
+            uint256 ethOut = uint256(uint128(s.amount0()));
+            poolManager.sync(k.currency1);
+            SafeTransferLib.safeTransfer(token, address(poolManager), sold);
+            poolManager.settle();
+            poolManager.take(k.currency0, address(this), ethOut);
+            return abi.encode(ethOut, sold);
+        }
         PoolKey memory key = what == 0 ? pool.poolKey() : imdPoolKey();
         BalanceDelta d = poolManager.swap(key, SwapParams(true, -int256(spend), TickMath.MIN_SQRT_PRICE + 1), "");
         uint256 ethIn = uint256(uint128(-d.amount0()));
