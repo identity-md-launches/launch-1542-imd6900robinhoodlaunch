@@ -26,7 +26,8 @@ import {IMD6900LockedPool} from "./IMD6900LockedPool.sol";
 ///             the coin's vanity address for THIS contract (it deploys the coin with CREATE2);
 ///          3. {launch}, one transaction, so nobody trades before it: the coin (1B, minted here), the pool opened with
 ///             all of it as IMD6900-only liquidity from the opening price down (no ETH needed, locked for good), the
-///             opening buy with every wei held here, the claims' reserve kept, the rest burned or sent on.
+///             opening buy with every wei held here, the claims' reserve kept, the rest kept here too (only the
+///             Robinhood timelock can release it: {releaseExcess}), or burned, or sent where the launch says.
 ///         Claims: IMDSTR in, IMD6900 out, 1:1, up to each holder's snapshot balance. IMDSTR moves only to and from
 ///         Robinhood distributors, so claiming opens once the Robinhood timelock makes this contract one.
 ///         Fees: the pool's 1% accrues to its locked position. {harvest} (anyone) collects it (the IMD6900 part is
@@ -72,8 +73,10 @@ contract IMD6900RobinhoodLaunch is Ownable, ReentrancyGuard {
     address public token;
     uint256 public launchEth;
     uint256 public launchBought;
-    /// @notice What the opening buy landed beyond the claims' reserve: burned, or sent where the launch said
+    /// @notice What the opening buy landed beyond the claims' reserve: kept here, burned, or sent where the launch said
     uint256 public launchExcess;
+    /// @notice The part of it still held here: only the Robinhood timelock moves it ({releaseExcess})
+    uint256 public excessHeld;
 
     /// @notice The claim list: a Merkle root of (account, IMDSTR balance) at the snapshot, their sum, and when the
     ///         unclaimed rest may be released. Set before the launch, fixed after.
@@ -108,6 +111,7 @@ contract IMD6900RobinhoodLaunch is Ownable, ReentrancyGuard {
     event PayFailed(address payee, uint256 amount);
     event PayeesSet(address[] payees, uint16[] shares);
     event EthRecovered(address to, uint256 amount);
+    event ExcessReleased(address to, uint256 amount);
     event ImdBurned(uint256 ethIn, uint256 imd);
     event ImdPoolSet(uint24 fee, int24 tickSpacing, address hooks);
 
@@ -216,8 +220,9 @@ contract IMD6900RobinhoodLaunch is Ownable, ReentrancyGuard {
 
     /// @notice The launch, in one transaction: creates the coin at the CREATE2 address `salt` gives (reverts unless
     ///         it is `expectedToken`), opens the pool at `sqrtPriceX96` (coin per ETH, rounded down onto a tick) with
-    ///         the whole supply, buys with every wei held here (the ETH sent included), keeps the claims' reserve and
-    ///         burns the rest (`excessTo` zero) or sends it to `excessTo`.
+    ///         the whole supply, buys with every wei held here (the ETH sent included), keeps the claims' reserve, and
+    ///         keeps the rest here for the timelock (`excessTo` this contract), burns it (`excessTo` zero) or sends it
+    ///         to `excessTo`.
     /// @param minBought the opening buy's floor; it must cover the claims' reserve in any case
     function launch(bytes32 salt, address expectedToken, uint160 sqrtPriceX96, uint256 minBought, address excessTo)
         external
@@ -242,7 +247,8 @@ contract IMD6900RobinhoodLaunch is Ownable, ReentrancyGuard {
 
         uint256 excess = SafeTransferLib.balanceOf(t, address(this)) - claimTotal; // the opening's rounding dust included
         if (excess != 0) {
-            if (excessTo == address(0)) IMD6900(t).burn(excess);
+            if (excessTo == address(this)) excessHeld = excess;
+            else if (excessTo == address(0)) IMD6900(t).burn(excess);
             else SafeTransferLib.safeTransfer(t, excessTo, excess);
         }
         (launchEth, launchBought, launchExcess) = (spend, bought, excess);
@@ -298,6 +304,18 @@ contract IMD6900RobinhoodLaunch is Ownable, ReentrancyGuard {
         SafeTransferLib.safeTransferETH(to, amount);
         if (imdBucket > address(this).balance) imdBucket = address(this).balance;
         emit EthRecovered(to, amount);
+    }
+
+    /// @notice Releases `amount` (all of it with 0) of the excess the launch kept here, to `to` (burned with zero):
+    ///         behind the timelock's delay, public for all of it
+    function releaseExcess(uint256 amount, address to) external nonReentrant {
+        if (msg.sender != timelock) revert NotTimelock();
+        if (amount == 0) amount = excessHeld;
+        if (amount == 0 || amount > excessHeld) revert ZeroAmount();
+        excessHeld -= amount;
+        if (to == address(0)) IMD6900(token).burn(amount);
+        else SafeTransferLib.safeTransfer(token, to, amount);
+        emit ExcessReleased(to, amount);
     }
 
     /// @notice Repoints $IMD's buys to another of its Robinhood pools (ETH / $IMD), behind the timelock's delay

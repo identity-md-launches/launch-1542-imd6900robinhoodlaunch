@@ -21,7 +21,7 @@ and the old IMDSTR claims the new coin 1:1, up to each holder's snapshot balance
 1. creates IMD6900 with CREATE2 from the launch (reverts unless it lands at `expectedToken`, the mined 0x6900… address);
 2. opens the pool at `sqrtPriceX96` with all 1B as IMD6900-only liquidity from that price down: no ETH needed, locked;
 3. buys first with every wei the launch holds (nobody can trade before: the coin didn't exist a moment earlier);
-4. keeps the claims' reserve and burns the rest of what it bought (or sends it to `excessTo`).
+4. keeps the claims' reserve, and keeps the rest of what it bought in the launch: only the timelock can release it (`releaseExcess`, 12h public delay), so no wallet ever holds it.
 
 The opening price comes from `script/params.py`: chosen so that after the buy the coin trades at IMD6900's Ethereum
 price (2.81 ETH: open at ~19.2 ETH market cap, land at ~25.2, ~126.7M bought). The pool's 1% fee then splits 70% to the

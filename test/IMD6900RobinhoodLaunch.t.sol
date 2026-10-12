@@ -237,6 +237,30 @@ contract IMD6900RobinhoodLaunchTest is Test {
         assertEq(IERC20(t).totalSupply(), SUPPLY);
     }
 
+    function test_KeepsTheExcessForTheTimelock() public {
+        _claims();
+        vm.deal(OWNER, BUY);
+        address expected_ = L.tokenAddress(bytes32(0));
+        vm.prank(OWNER);
+        (address t,) = L.launch{value: BUY}(bytes32(0), expected_, _sqrtPrice(OPEN_MC), 0, address(L));
+        uint256 excess = L.excessHeld();
+        assertGt(excess, 0);
+        assertEq(IERC20(t).balanceOf(address(L)), AA + BB + CC + excess, "the reserve and the excess, both here");
+        assertEq(IERC20(t).totalSupply(), SUPPLY, "nothing burned");
+        vm.prank(OWNER);
+        vm.expectRevert(IMD6900RobinhoodLaunch.NotTimelock.selector);
+        L.releaseExcess(0, OWNER);
+        // the timelock can't reach the claims' reserve through it
+        vm.prank(TL);
+        vm.expectRevert(IMD6900RobinhoodLaunch.ZeroAmount.selector);
+        L.releaseExcess(excess + 1, TL);
+        vm.prank(TL);
+        L.releaseExcess(0, TL);
+        assertEq(IERC20(t).balanceOf(TL), excess);
+        assertEq(IERC20(t).balanceOf(address(L)), AA + BB + CC);
+        assertEq(L.excessHeld(), 0);
+    }
+
     function test_EthComesBackBeforeTheLaunchOnly() public {
         vm.deal(address(L), 1 ether);
         vm.prank(OWNER);
