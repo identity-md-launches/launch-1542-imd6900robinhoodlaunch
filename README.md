@@ -9,10 +9,10 @@ and the old IMDSTR claims the new coin 1:1, up to each holder's snapshot balance
 
 | | |
 |---|---|
-| `src/IMD6900RobinhoodLaunch.sol` | What the swarm deploys. Its constructor creates the pool and mines the hook's address; it calls nothing that existed before it. Then the launch, the claims, the fee split. |
+| `src/IMD6900RobinhoodLaunch.sol` | What the swarm deploys. Its constructor creates the locked pool and calls nothing that existed before it (~6.0M gas, the same from any deployer). `createHook(salt)` (anyone, once) then creates the hook at a salt mined off-chain for its address. Then the launch, the claims, the fee split. |
 | `src/IMD6900.sol` | The coin: 1B minted once to the launch. No owner, no mint, no tax, no pause, no blacklist, no limits, no proxy. Holders can burn their own. |
-| `src/IMD6900LockedPool.sol` | Owns the pool's one position. No owner, no way to take liquidity out. `collect()` (anyone): ETH fees to the split, IMD6900 fees burned. |
-| `src/IMD6900Hook.sol` | ETH / IMD6900 only, initialized once by the locked pool, liquidity from it only. Sets the pool's fee on every swap: 6.9% at the launch, gliding to 4.44% over the first week, then 3.33% (the timelock can lower it, never raise it); the perps engine's own trades and the launch's opening buy pay none. In-pool perps sweep once the timelock wires an engine. No return deltas, not upgradeable. Owned by the Robinhood timelock. |
+| `src/IMD6900LockedPool.sol` | Owns the pool's one position. No owner, no way to take liquidity out. `collect()` (anyone): ETH fees to the split, IMD6900 fees burned. `lowerFee(fee)` (the timelock only, lower only): moves the position, in one transaction, into a new pool at the lower fee and the same price. |
+| `src/IMD6900Hook.sol` | ETH / IMD6900 only, at the locked pool's static fee, initialized by the locked pool only (at the launch, and at each lower fee it moves to), liquidity from it only. Charges nothing itself: no dynamic fee, no return deltas. In-pool perps sweep once the timelock wires an engine. Not upgradeable. Owned by the Robinhood timelock. |
 
 ## The launch, one transaction
 
@@ -23,17 +23,27 @@ and the old IMDSTR claims the new coin 1:1, up to each holder's snapshot balance
 3. buys first with every wei the launch holds (nobody can trade before: the coin didn't exist a moment earlier);
 4. keeps the claims' reserve, and keeps the rest of what it bought in the launch: only the timelock can release it (`releaseExcess`, 12h public delay), so no wallet ever holds it.
 
-The opening price comes from `script/params.py`: chosen so that after the buy the coin trades at IMD6900's Ethereum
-price (2.81 ETH, fee-free: open at ~19.2 ETH market cap, land at ~25.2, ~127.8M bought). The pool's fee then splits 70% to the
+The opening price and the buy come from `script/params.py`, so that after the buy the coin trades at exactly IMD6900's
+Ethereum price: the pool opens on a tick (0.6% apart), so it rounds the opening onto one and sizes the buy to land on
+the price from there (today: open at ~19.5 ETH market cap, buy ~2.77 of the 2.81 ETH, 4.44% fee included, land at
+~25.15 = Ethereum's, ~119.5M bought). The pool's fee (4.44% on every trade, the opening buy's too) then splits 70% to the
 pot bridge (Ethereum's NFT pot), 10% to $IMD's burn (bought on $IMD's Robinhood pool, sent to IMD's official burn
 executor `0x4D6537ec564aFf82eABb1Ce5f355E817cBEA1e07`, fixed in the code, which bridges it to Base), 20% ops; the
 IMD6900 part is burned. The split is the Robinhood timelock's to change (`setPayees`, 12h public delay).
 
-## Routing
+## The fee, and routing
 
-The fee is dynamic (set by the hook per swap), so Uniswap's app and API route the pool once Uniswap has reviewed the
-hook (developers.uniswap.org/hook-allowlist; Programmable's plan opts in to the hook list and Uniswap's API). Until
-then it trades through Programmable, Uniswap's Universal Router (the fork test buys through it) and direct calls.
+4.44%, a plain static fee: Uniswap's router quotes the pool on its own (no dynamic fee, no return deltas, not a 0x91
+hook; Programmable's plan opts in to the hook list and Uniswap's API too). A v4 pool's fee can't change, so lowering it
+means a new pool: `lowerFee(newFee)` (the timelock, behind its 12h delay; only ever lower, 0 allowed) initializes the
+ETH / IMD6900 pool at `newFee` at the current price, and moves the whole position there in one unlock. Nothing leaves
+but the old pool's earned fees (to the split, like any `collect`); the old pool is left empty and its swaps revert; the
+new one is routable the same way (the fork test buys through the Universal Router before and after a move to 3.33%).
+
+## The liquidity: locked, its fees not
+
+The position belongs to `IMD6900LockedPool`, which has no owner and no function that takes liquidity out to anyone:
+it is as good as burned. What it earns isn't locked: `collect()` (or `harvest()` on the launch), anyone, any time.
 
 ## Red flags, and why there are none
 
@@ -47,12 +57,13 @@ swap, so it goes in only behind the delay.
 ## Tests
 
 ```sh
-forge test                                         # 31 tests, offline: admission, launch, pool, fees, $IMD burn, claims
+forge test                                         # 32 tests, offline: admission, launch, pool, fees, the fee's move, $IMD burn, claims
 ROBINHOOD_RPC_URL=https://rpc.mainnet.chain.robinhood.com forge test --match-contract RobinhoodFork -vv
 ```
 
 The fork test runs the whole thing on live Robinhood state: the real PoolManager, IMDSTR (claims after the timelock's
-distributor op), the pot bridge, $IMD's pool and burn executor, and a buy through Uniswap's Universal Router.
+distributor op), the pot bridge, $IMD's pool and burn executor, buys through Uniswap's Universal Router, and a move to
+a 3.33% pool.
 
 ## Runbook: `script/launch.sh`
 
@@ -61,7 +72,8 @@ through Programmable (the same `launch()`, after their review, with their stamp 
 team wallet's keystore (`imdstr-deployer`); `script/launch.sh status` shows where things stand.
 
 1. `fund`: the Pons launcher's 2.83 ETH back to the team wallet.
-2. `deploy`: the launch contract (its constructor creates the locked pool and mines the hook).
+2. `deploy`: the launch contract (its constructor creates the locked pool), or `use <addr>`: the swarm's.
+   Then `hook`: the hook's salt mined for that address (`cast create2`), and `createHook(salt)`.
 3. `claims`: the claim list from live balances capped at the snapshot (35 holders, ~63.9M), deadline in 120 days.
 4. `queue-claims`, then `open-claims` 12h later: the timelock makes the launch an IMDSTR distributor.
 5. `mine`: the coin's 0x6900… address for this launch.

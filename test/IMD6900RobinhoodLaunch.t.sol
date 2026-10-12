@@ -6,6 +6,8 @@ import {IPoolManager} from "@uniswap/v4-core/src/interfaces/IPoolManager.sol";
 import {PoolManager} from "@uniswap/v4-core/src/PoolManager.sol";
 import {Hooks} from "@uniswap/v4-core/src/libraries/Hooks.sol";
 import {PoolKey} from "@uniswap/v4-core/src/types/PoolKey.sol";
+import {PoolIdLibrary} from "@uniswap/v4-core/src/types/PoolId.sol";
+import {StateLibrary} from "@uniswap/v4-core/src/libraries/StateLibrary.sol";
 import {Currency} from "@uniswap/v4-core/src/types/Currency.sol";
 import {BalanceDelta} from "@uniswap/v4-core/src/types/BalanceDelta.sol";
 import {SwapParams, ModifyLiquidityParams} from "@uniswap/v4-core/src/types/PoolOperation.sol";
@@ -16,6 +18,7 @@ import {IMD6900} from "../src/IMD6900.sol";
 import {IMD6900Hook} from "../src/IMD6900Hook.sol";
 import {IMD6900LockedPool} from "../src/IMD6900LockedPool.sol";
 import {IMD6900RobinhoodLaunch} from "../src/IMD6900RobinhoodLaunch.sol";
+import {HookSalt} from "./HookSalt.sol";
 
 interface IERC20 {
     function balanceOf(address) external view returns (uint256);
@@ -100,6 +103,8 @@ contract Squatter {
 }
 
 contract IMD6900RobinhoodLaunchTest is Test {
+    using PoolIdLibrary for PoolKey;
+    using StateLibrary for IPoolManager;
     address constant OWNER = address(0xA11CE);
     address constant TL = address(0x71E10C);
     address constant POT = 0xc39e650a24985C2bBA9FD83C81041B8f3E3f9EDd;
@@ -128,7 +133,7 @@ contract IMD6900RobinhoodLaunchTest is Test {
         PM = IPoolManager(address(new PoolManager(address(this))));
         imdstr = new MockImdstr();
         L = new IMD6900RobinhoodLaunch(OWNER, PM, address(imdstr), TL);
-        hook = L.hook();
+        hook = L.createHook(HookSalt.mine(L));
         pool = L.pool();
         imdstr.mint(A, AA); imdstr.mint(B, BB); imdstr.mint(C, CC);
         trader = new Trader(PM);
@@ -140,6 +145,7 @@ contract IMD6900RobinhoodLaunchTest is Test {
 
     function test_DeploysOnAFreshChain() public {
         IMD6900RobinhoodLaunch l = new IMD6900RobinhoodLaunch(OWNER, NO_CODE, address(imdstr), TL);
+        l.createHook(HookSalt.mine(l));
         assertEq(l.owner(), OWNER);
         assertEq(l.pool().hook(), address(l.hook()));
         assertEq(l.hook().pool(), address(l.pool()));
@@ -150,10 +156,16 @@ contract IMD6900RobinhoodLaunchTest is Test {
 
     function test_FitsOneTransaction() public {
         uint256 g = gasleft();
-        new IMD6900RobinhoodLaunch(OWNER, PM, address(imdstr), TL);
+        IMD6900RobinhoodLaunch l = new IMD6900RobinhoodLaunch(OWNER, PM, address(imdstr), TL);
         uint256 used = g - gasleft();
-        emit log_named_uint("launch deploy gas (the hook's mining included)", used);
-        assertLt(used, 1 << 24, "under EIP-7825's per-transaction cap");
+        emit log_named_uint("launch deploy gas (the same for every deployer: no mining)", used);
+        assertLt(used, 1 << 23, "half EIP-7825's per-transaction cap");
+        bytes32 s = HookSalt.mine(l);
+        g = gasleft();
+        l.createHook(s);
+        used = g - gasleft();
+        emit log_named_uint("createHook gas", used);
+        assertLt(used, 1 << 22);
     }
 
     function test_PassesTheAdmissionScan() public view {
@@ -167,15 +179,33 @@ contract IMD6900RobinhoodLaunchTest is Test {
     function test_TheHooksAddressAndPermissions() public view {
         assertEq(uint160(address(hook)) & Hooks.ALL_HOOK_MASK, L.FLAGS(), "carries exactly its flags");
         assertTrue(uint160(address(hook)) >> 152 != 0x91, "not a 0x91 address");
-        assertEq(hook.launcher(), address(L));
         Hooks.Permissions memory p = hook.getHookPermissions();
         assertFalse(p.beforeSwapReturnDelta || p.afterSwapReturnDelta || p.afterAddLiquidityReturnDelta || p.afterRemoveLiquidityReturnDelta);
     }
 
     function test_EachDeployerMinesItsOwnHook() public {
         IMD6900RobinhoodLaunch b = new IMD6900RobinhoodLaunch(OWNER, PM, address(imdstr), TL);
+        bytes32 s = HookSalt.mine(b);
+        b.createHook(s);
         assertTrue(address(b.hook()) != address(hook));
         assertEq(uint160(address(b.hook())) & Hooks.ALL_HOOK_MASK, b.FLAGS());
+        assertEq(b.hookSalt(), s);
+    }
+
+    function test_TheHookIsCreatedOnceAtAFittingSalt() public {
+        IMD6900RobinhoodLaunch b = new IMD6900RobinhoodLaunch(OWNER, PM, address(imdstr), TL);
+        assertEq(address(b.hook()), address(0));
+        assertEq(b.pool().hook(), address(0), "the pool can't open before");
+        bytes32 s = HookSalt.mine(b);
+        bytes32 s2 = HookSalt.mine(b, uint256(s) + 1);
+        vm.expectRevert(IMD6900RobinhoodLaunch.BadHook.selector);
+        b.createHook(bytes32(uint256(s2) - 1)); // between two fitting salts: doesn't fit
+        vm.prank(address(0xBEEF)); // anyone: every salt it accepts makes the same hook
+        IMD6900Hook h = b.createHook(s);
+        assertEq(b.pool().hook(), address(h));
+        assertEq(h.owner(), TL);
+        vm.expectRevert(IMD6900RobinhoodLaunch.HookExists.selector);
+        b.createHook(s2);
     }
 
     /*                                THE LAUNCH                             */
@@ -185,18 +215,18 @@ contract IMD6900RobinhoodLaunchTest is Test {
         assertEq(t, L.tokenAddress(bytes32(0)));
         assertEq(L.token(), t);
         emit log_named_decimal_uint("opening buy, coins", bought, 18);
-        // constant product from 19.18 ETH: 2.81 ETH, fee-free (the hook exempts the launch's own buy), lands ~12.78%
-        assertApproxEqRel(bought, 127_790_000 ether, 0.005e18);
+        // constant product from 19.18 ETH: 2.81 ETH less the pool's 4.44% lands ~12.28%
+        assertApproxEqRel(bought, 122_810_000 ether, 0.005e18);
         assertEq(IERC20(t).balanceOf(address(L)), AA + BB + CC, "exactly the claims' reserve stays");
         uint256 burned = L.launchExcess();
         assertEq(IERC20(t).totalSupply(), SUPPLY - burned, "the rest is burned");
         assertEq(address(L).balance, 0, "every wei went into the buy");
-        assertEq(address(PM).balance, BUY, "the pool holds the ETH the buy paid");
+        assertEq(address(PM).balance, BUY, "the pool holds the ETH the buy paid (its fee included, in the position)");
         // the price it left: ETH per coin, on a billion coins
         (uint160 sq,,) = pool.state();
         uint256 mc = FullMath.mulDiv(FullMath.mulDiv(SUPPLY, 1 << 96, sq), 1 << 96, sq); // coins / (coins per ETH)
         emit log_named_decimal_uint("market cap after the buy, ETH on 1B", mc, 18);
-        assertApproxEqRel(mc, 25.21 ether, 0.01e18, "Ethereum's price");
+        assertApproxEqRel(mc, 24.93 ether, 0.01e18, "Ethereum's price, about");
     }
 
     function test_RefusesTheWrongAddress() public {
@@ -346,7 +376,7 @@ contract IMD6900RobinhoodLaunchTest is Test {
         emit log_named_decimal_uint("pot bridge", toPot, 18);
         emit log_named_decimal_uint("ops", toOps, 18);
         uint256 fees = toPot + toOps + L.imdBucket();
-        assertApproxEqRel(fees, 0.69 ether, 0.001e18, "6.9% of the trader's buy; the opening buy paid none");
+        assertApproxEqRel(fees, (10 ether + BUY) * 444 / 10_000, 0.001e18, "4.44% of the buys, the opening buy's included");
         assertApproxEqRel(toPot, fees * 7 / 10, 1e14, "70% the pot");
         assertApproxEqRel(L.imdBucket(), fees / 10, 1e14, "10% set aside for $IMD's burn");
         assertApproxEqRel(toOps, fees * 2 / 10, 1e14, "20% ops");
@@ -402,61 +432,71 @@ contract IMD6900RobinhoodLaunchTest is Test {
 
     /*                                THE FEE                                */
 
-    function test_TheFeesSchedule() public {
-        assertEq(hook.currentFee(), 69_000, "6.9% before the launch: what it opens at");
+    function test_TheFeeIsStatic() public {
         _launch();
-        uint256 t0 = hook.launchedAt(); // not block.timestamp: via-IR may re-read that after a warp
-        assertEq(hook.currentFee(), 69_000, "6.9% at the launch");
-        vm.warp(t0 + 3.5 days);
-        assertEq(hook.currentFee(), 56_700, "halfway down the glide");
-        vm.warp(t0 + 7 days - 1);
-        assertApproxEqAbs(hook.currentFee(), 44_400, 1, "4.44% at the end of the first week");
-        vm.warp(t0 + 7 days);
-        assertEq(hook.currentFee(), 33_300, "3.33% from then on");
-        vm.warp(t0 + 365 days);
-        assertEq(hook.currentFee(), 33_300);
-    }
-
-    function test_TradersPayTheSchedule() public {
-        _launch();
-        uint256 t0 = hook.launchedAt();
         PoolKey memory k = pool.poolKey();
-        trader.swap(k, true, -1 ether);
-        vm.warp(t0 + 8 days);
+        assertEq(k.fee, 44_400, "4.44%, a plain static fee: Uniswap routes it on its own");
         trader.swap(k, true, -1 ether);
         (uint256 eth,) = pool.collect();
-        assertApproxEqRel(eth, 0.069 ether + 0.0333 ether, 0.001e18, "6.9% on day one, 3.33% after the first week");
+        assertApproxEqRel(eth, (1 ether + BUY) * 444 / 10_000, 0.001e18, "4.44% of the buys, the opening buy's included");
     }
 
-    function test_OnlyTheTimelockLowersTheFee() public {
+    function test_LowerFeeMovesTheLiquidity() public {
+        (address t,) = _launch();
+        PoolKey memory old = pool.poolKey();
+        trader.swap(old, true, -5 ether); // fees earned in the old pool
+        (uint160 p0,,) = pool.state();
+        uint128 l0 = pool.liquidity();
+        uint256 supply = IERC20(t).totalSupply();
+        uint256 lBefore = address(L).balance;
+        vm.prank(TL);
+        uint128 l1 = pool.lowerFee(33_300);
+        PoolKey memory neu = pool.poolKey();
+        assertEq(neu.fee, 33_300);
+        (uint160 p1,, uint128 inPool) = pool.state();
+        assertEq(p1, p0, "same price");
+        assertApproxEqRel(l1, l0, 1e9, "all of the liquidity moved (to the wei of rounding)");
+        assertEq(inPool, l1, "and it is all the new pool has");
+        assertEq(PM.getLiquidity(old.toId()), 0, "the old pool is empty");
+        assertApproxEqRel(address(L).balance - lBefore, (5 ether + BUY) * 444 / 10_000, 0.001e18, "only the old pool's earned fees came out");
+        assertLe(IERC20(t).totalSupply(), supply, "its IMD6900 fees burned");
+        // trading goes on in the new pool, at the new fee; the old one is closed
+        trader.swap(neu, true, -1 ether);
+        (uint256 eth,) = pool.collect();
+        assertApproxEqRel(eth, 0.0333 ether, 0.001e18);
+        vm.expectRevert();
+        trader.swap(old, true, -1 ether);
+    }
+
+    function test_OnlyTheTimelockLowersTheFeeAndOnlyDown() public {
         _launch();
         vm.prank(OWNER);
-        vm.expectRevert(Ownable.Unauthorized.selector);
-        hook.lowerFee(20_000);
+        vm.expectRevert(IMD6900LockedPool.OnlyTimelock.selector);
+        pool.lowerFee(33_300);
         vm.prank(TL);
-        hook.lowerFee(20_000);
-        assertEq(hook.currentFee(), 20_000, "the cap under the schedule");
+        vm.expectRevert(IMD6900LockedPool.NotLower.selector);
+        pool.lowerFee(44_400);
         vm.prank(TL);
-        vm.expectRevert(IMD6900Hook.InvalidFee.selector);
-        hook.lowerFee(30_000); // never back up
-        vm.warp(block.timestamp + 30 days);
-        assertEq(hook.currentFee(), 20_000, "the cap holds after the glide too");
+        vm.expectRevert(IMD6900LockedPool.NotLower.selector);
+        pool.lowerFee(100_000);
+        vm.prank(TL);
+        pool.lowerFee(0); // no fee at all, if the timelock ever wants it
+        assertEq(pool.fee(), 0);
+        trader.swap(pool.poolKey(), true, -1 ether);
+        (uint256 eth,) = pool.collect();
+        assertEq(eth, 0);
     }
 
-    function test_ThePerpsEngineTradesFeeFree() public {
+    function test_ThePerpsEngineTradesThroughTheHook() public {
         _launch();
         Engine engine = new Engine(PM);
         vm.deal(address(engine), 10 ether);
         vm.prank(TL);
         hook.setPerpEngine(address(engine));
-        assertEq(hook.feeFor(address(engine)), 0);
-        assertEq(hook.feeFor(address(trader)), 69_000);
-        engine.swap(pool.poolKey(), true, -1 ether);
+        engine.swap(pool.poolKey(), true, -1 ether); // its own trade: no sweep
+        trader.swap(pool.poolKey(), true, -1 ether); // a trader's: the engine's (empty) sweep runs first
         (uint256 eth,) = pool.collect();
-        assertEq(eth, 0, "the engine's trade paid nothing");
-        trader.swap(pool.poolKey(), true, -1 ether); // and a trader's swap runs the engine's (empty) sweep
-        (eth,) = pool.collect();
-        assertApproxEqRel(eth, 0.069 ether, 0.001e18);
+        assertApproxEqRel(eth, (2 ether + BUY) * 444 / 10_000, 0.001e18, "both pay the pool's fee, into the protocol's own position");
     }
 
     function test_OnlyTheTimelockRepointsImdsPool() public {

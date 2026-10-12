@@ -18,9 +18,11 @@ import {IMD6900LockedPool} from "./IMD6900LockedPool.sol";
 
 /// @title IMD6900RobinhoodLaunch - Identity.MD 6900 (IMD6900) on Robinhood Chain: the coin, its locked Uniswap v4 pool
 ///        with the perps hook, the opening buy, the 1:1 claim for the old IMDSTR, the fee split
-/// @notice Deployed by the IMD swarm. Its constructor creates the locked pool and the hook (at an address it mines to
-///         carry exactly the hook's permissions, never 0x91…) and calls nothing
-///         that existed before it. Then:
+/// @notice Deployed by the IMD swarm. Its constructor creates the locked pool and calls nothing that existed before
+///         it. Then:
+///          0. {createHook} (anyone, once): the hook, with CREATE2 from here, at a salt mined off-chain for this
+///             contract's address so the hook's address carries exactly its permissions (never 0x91…, so Uniswap
+///             routes the pool on its own). Every salt it accepts makes the same hook: same code, permissions, owner;
 ///          1. the team sends the opening buy's ETH (or sends it with {launch}); {withdrawEth} takes it back until then;
 ///          2. the owner sets the claim list ({setClaims}: a Merkle root of the snapshot's IMDSTR balances) and mines
 ///             the coin's vanity address for THIS contract (it deploys the coin with CREATE2);
@@ -30,20 +32,21 @@ import {IMD6900LockedPool} from "./IMD6900LockedPool.sol";
 ///             Robinhood timelock can release it: {releaseExcess}), or burned, or sent where the launch says.
 ///         Claims: IMDSTR in, IMD6900 out, 1:1, up to each holder's snapshot balance. IMDSTR moves only to and from
 ///         Robinhood distributors, so claiming opens once the Robinhood timelock makes this contract one.
-///         Fees: the pool's fee (its hook's schedule: 6.9% gliding to 4.44% over the first week, then 3.33%) accrues
-///         to its locked position. {harvest} (anyone) collects it (the IMD6900 part is
+///         Fees: the pool's static 4.44% (the timelock can move the liquidity to a lower-fee pool, never higher)
+///         accrues to its locked position. {harvest} (anyone) collects it (the IMD6900 part is
 ///         burned by the pool) and splits the ETH: 70% to the pot bridge (Ethereum's NFT pot), 10% to $IMD's burn,
 ///         20% ops, until the Robinhood timelock sets other payees ({setPayees}, behind its delay). The $IMD share is kept here and {burnImd} (anyone) spends it,
 ///         at most {IMD_BUY_MAX} a call, buying $IMD on its Robinhood pool for IMD's official burn executor there,
 ///         which bridges it to Base to be destroyed. After the launch, ETH leaves only through the split, the $IMD
 ///         buys, or the timelock's {recoverEth}.
 contract IMD6900RobinhoodLaunch is Ownable, ReentrancyGuard {
-    /// @dev beforeInitialize, beforeAddLiquidity, beforeRemoveLiquidity, beforeSwap, afterSwap: no return deltas
+    /// @dev beforeInitialize, beforeAddLiquidity, beforeRemoveLiquidity, beforeSwap, afterSwap: no return deltas, no
+    ///      dynamic fee, nothing that would cost the pool Uniswap's automatic routing
     uint160 public constant FLAGS = Hooks.BEFORE_INITIALIZE_FLAG | Hooks.BEFORE_ADD_LIQUIDITY_FLAG
         | Hooks.BEFORE_REMOVE_LIQUIDITY_FLAG | Hooks.BEFORE_SWAP_FLAG | Hooks.AFTER_SWAP_FLAG;
-    /// @notice The pool's fee is dynamic: its hook sets it on every swap (6.9% gliding to 4.44% over the first week,
-    ///         then 3.33%; nothing for the perps engine or the opening buy)
-    uint24 public constant POOL_FEE = 0x800000; // LPFeeLibrary.DYNAMIC_FEE_FLAG
+    /// @notice The pool's opening fee, hundredths of a bip: 4.44%, static (so Uniswap routes the pool on its own).
+    ///         Only the Robinhood timelock can lower it (IMD6900LockedPool.lowerFee), never raise it.
+    uint24 public constant POOL_FEE = 44_400;
     uint256 public constant SUPPLY = 1_000_000_000 ether;
     /// @notice PonsPotBridge on Robinhood: bridges ETH (Across) to the Ethereum launch hook, which feeds IMD6900's NFT pot
     address public constant POT_BRIDGE = 0xc39e650a24985C2bBA9FD83C81041B8f3E3f9EDd;
@@ -58,13 +61,12 @@ contract IMD6900RobinhoodLaunch is Ownable, ReentrancyGuard {
     uint256 public constant MAX_PAYEES = 8;
     /// @notice Claims stay open at least this long after the launch before the unclaimed reserve can be released
     uint256 public constant MIN_CLAIM_WINDOW = 90 days;
-    /// @dev One salt in ~16,450 fits on average; a million tries leave a miss at about e^-63
-    uint256 internal constant MAX_TRIES = 1 << 20;
 
     IPoolManager public immutable poolManager;
     IMD6900LockedPool public immutable pool;
-    IMD6900Hook public immutable hook;
-    bytes32 public immutable hookSalt;
+    /// @notice The pool's hook, once {createHook} made it
+    IMD6900Hook public hook;
+    bytes32 public hookSalt;
     /// @notice Robinhood's IMDSTR, the old token that claims IMD6900 1:1
     address public immutable imdstr;
     /// @notice The Robinhood timelock: owns the hook, and is the one way ETH leaves after the launch besides the split
@@ -101,6 +103,7 @@ contract IMD6900RobinhoodLaunch is Ownable, ReentrancyGuard {
     uint16[8] internal _shares;
     uint8 internal _payeeCount;
 
+    event HookCreated(address hook, bytes32 salt);
     event ClaimsSet(bytes32 root, uint256 total, uint256 deadline);
     event EthWithdrawn(address to, uint256 amount);
     event Launched(address token, uint160 sqrtPriceX96, int24 upperTick, uint256 ethSpent, uint256 bought, uint256 excess, address excessTo);
@@ -116,7 +119,7 @@ contract IMD6900RobinhoodLaunch is Ownable, ReentrancyGuard {
     event ImdBurned(uint256 ethIn, uint256 imd);
     event ImdPoolSet(uint24 fee, int24 tickSpacing, address hooks);
 
-    error NoSalt();
+    error HookExists();
     error BadHook();
     error AlreadyLaunched();
     error NotLaunched();
@@ -142,19 +145,33 @@ contract IMD6900RobinhoodLaunch is Ownable, ReentrancyGuard {
         poolManager = poolManager_;
         imdstr = imdstr_;
         timelock = timelock_;
-        IMD6900LockedPool p = new IMD6900LockedPool(poolManager_, POOL_FEE, address(this));
-        bytes memory init =
-            abi.encodePacked(type(IMD6900Hook).creationCode, abi.encode(poolManager_, address(p), timelock_));
-        bytes32 s = _mine(keccak256(init));
+        pool = new IMD6900LockedPool(poolManager_, POOL_FEE, address(this), timelock_);
+    }
+
+    /*                              THE HOOK                                */
+
+    /// @notice Creates the hook at `salt` and wires the pool to it; anyone, once. The salt is mined off-chain
+    ///         (script/launch.sh hook): its CREATE2 address from here, for {hookInitCodeHash}, must carry exactly
+    ///         {FLAGS} in its low 14 bits and not start with 0x91. Mining it here instead would cost the deploy a random
+    ///         ~2.6M gas on average and, about one address in fifty, more than a transaction can hold.
+    function createHook(bytes32 salt) external returns (IMD6900Hook) {
+        if (address(hook) != address(0)) revert HookExists();
+        bytes memory init = _hookInitCode();
         address h;
         assembly ("memory-safe") {
-            h := create2(0, add(init, 0x20), mload(init), s)
+            h := create2(0, add(init, 0x20), mload(init), salt)
         }
         if (h == address(0) || uint160(h) & Hooks.ALL_HOOK_MASK != FLAGS || uint160(h) >> 152 == 0x91) revert BadHook();
-        p.setHook(h);
-        pool = p;
+        pool.setHook(h);
         hook = IMD6900Hook(h);
-        hookSalt = s;
+        hookSalt = salt;
+        emit HookCreated(h, salt);
+        return IMD6900Hook(h);
+    }
+
+    /// @notice keccak256 of the hook's creation code with its constructor arguments: the init code hash to mine against
+    function hookInitCodeHash() external view returns (bytes32) {
+        return keccak256(_hookInitCode());
     }
 
     /// @notice Before the launch, the opening buy's ETH (anyone may send it, only the owner takes it back); after, fees
@@ -410,29 +427,8 @@ contract IMD6900RobinhoodLaunch is Ownable, ReentrancyGuard {
 
     /*                              INTERNAL                                */
 
-    /// @dev The first salt whose CREATE2 address from here carries exactly {FLAGS} in its low 14 bits and doesn't
-    ///      start with 0x91 (Uniswap reviews those by hand)
-    function _mine(bytes32 initHash) internal view returns (bytes32 s) {
-        address me = address(this);
-        uint256 flags = FLAGS;
-        uint256 tries = MAX_TRIES;
-        bool found;
-        assembly ("memory-safe") {
-            let ptr := mload(0x40)
-            mstore(ptr, me) // the address in bytes 12..31
-            mstore8(add(ptr, 11), 0xff) // 0xff ++ address ++ salt ++ initHash: 85 bytes from ptr + 11
-            mstore(add(ptr, 0x40), initHash)
-            for { let i := 0 } lt(i, tries) { i := add(i, 1) } {
-                mstore(add(ptr, 0x20), i)
-                let a := keccak256(add(ptr, 11), 85)
-                if and(eq(and(a, 0x3fff), flags), iszero(eq(and(shr(152, a), 0xff), 0x91))) {
-                    s := i
-                    found := 1
-                    break
-                }
-            }
-        }
-        if (!found) revert NoSalt();
+    function _hookInitCode() internal view returns (bytes memory) {
+        return abi.encodePacked(type(IMD6900Hook).creationCode, abi.encode(poolManager, address(pool), timelock));
     }
 
     /// @dev A Merkle proof over sorted pairs

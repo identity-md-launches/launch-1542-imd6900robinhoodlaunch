@@ -14,10 +14,11 @@ import {LPFeeLibrary} from "@uniswap/v4-core/src/libraries/LPFeeLibrary.sol";
 import {TickMath} from "@uniswap/v4-core/src/libraries/TickMath.sol";
 import {Ownable} from "solady/auth/Ownable.sol";
 
-/// @notice IMD6900LockedPool: the one position this hook allows, and the coin it pairs with ETH
+/// @notice IMD6900LockedPool: the one position this hook allows, the coin it pairs with ETH, and the pool's fee
 interface ILockedPoolView {
     function token() external view returns (address);
     function upperTick() external view returns (int24);
+    function fee() external view returns (uint24);
 }
 
 /// @notice The perps engine, once there is one: liquidates every position a trade would sink, before it runs
@@ -26,56 +27,40 @@ interface IPerpSweep {
     function openCount() external view returns (uint256);
 }
 
-/// @title IMD6900Hook - the ETH / IMD6900 pool's hook on Robinhood Chain: a locked pool, its fee, in-pool perps to come
+/// @title IMD6900Hook - the ETH / IMD6900 pool's hook on Robinhood Chain: a locked pool, in-pool perps to come
 /// @notice IMD6900RobinhoodLaunch creates it at an address that carries exactly its permissions. What it does:
-///          - the pool is ETH / IMD6900 only, with a dynamic fee, initialized once, by IMD6900LockedPool;
-///          - liquidity comes from IMD6900LockedPool only, in its one range: nobody else can add a position, and that
-///            pool has no way to take liquidity out, so the pool's liquidity is locked for good;
-///          - the fee: 6.9% at the launch, gliding down to 4.44% over the first week, then 3.33% for good; the
-///            Robinhood timelock can lower it further, never raise it ({lowerFee}). The perps engine's own trades
-///            pay none (perps earn their opening fee and funding in the engine), nor does the launch's opening buy.
-///            It is the pool's own LP fee, set per swap (no return deltas: the hook never touches a swap's amounts),
-///            so it accrues to the locked position like any LP fee;
+///          - the pool is ETH / IMD6900 only, at a static fee, initialized by IMD6900LockedPool only: at the launch,
+///            and again each time the timelock moves the liquidity to a pool with a lower fee (it serves the newest);
+///          - liquidity comes from IMD6900LockedPool only, in its one range: nobody else can add a position;
 ///          - before any swap that is not the perps engine's own, the engine (once the Robinhood timelock wires one)
 ///            closes every position the trade would sink, at the price before it moves; a sweep that can't finish
 ///            reverts the trade (no bad debt outranks always-tradeable). Until an engine is set it does nothing.
+///         No return deltas and no dynamic fee: the hook never touches a swap's amounts and charges nothing itself,
+///         the pool's static fee is all there is, so Uniswap's router quotes the pool on its own.
 contract IMD6900Hook is BaseHook, Ownable {
     using PoolIdLibrary for PoolKey;
 
     int24 public constant TICK_SPACING = 60;
-    /// @notice The fee, in hundredths of a bip (1e6 = 100%): 6.9% at the launch, gliding to 4.44% over the first
-    ///         week, then 3.33%
-    uint24 public constant FEE_START = 69_000;
-    uint24 public constant FEE_WEEK_END = 44_400;
-    uint24 public constant FEE_AFTER = 33_300;
-    uint256 public constant GLIDE = 7 days;
     /// @dev Gas kept back for the rest of the swap when a sweep runs, and the least worth forwarding
     uint256 internal constant SWEEP_GAS_RESERVE = 180_000;
     uint256 internal constant SWEEP_GAS_MIN = 400_000;
 
     /// @notice IMD6900LockedPool: initializes the pool and owns all of its liquidity
     address public immutable pool;
-    /// @notice IMD6900RobinhoodLaunch, which creates this hook: its opening buy pays no fee
-    address public immutable launcher;
 
     /// @notice The perps engine; zero means spot only
     address public perpEngine;
     /// @notice Escape hatch: trade even when the pre-trade sweep can't run (meant only while an engine is replaced)
     bool public sweepFailOpen;
-    /// @notice The one pool this hook serves, and when it opened (the fee's schedule counts from there)
+    /// @notice The pool this hook serves: the newest the locked pool initialized
     PoolId public poolId;
-    uint256 public launchedAt;
-    /// @notice The most the fee may be, whatever the schedule says: only ever lowered, by the timelock
-    uint24 public feeCap = FEE_START;
 
     event PerpEngineSet(address engine);
     event SweepFailOpenSet(bool on);
-    event FeeLowered(uint24 cap);
 
     error NotOurPool();
     error OnlyPool();
     error WrongRange();
-    error InvalidFee();
     /// @notice The pre-trade liquidation sweep ran out of gas: send the trade with more gas
     error SweepGasStarved();
     /// @notice The trade would sink more positions than one transaction can liquidate: trade smaller
@@ -84,10 +69,9 @@ contract IMD6900Hook is BaseHook, Ownable {
     error SweepUnavailable();
     error NoRenounce();
 
-    /// @param owner_ the Robinhood timelock: the engine, the escape hatch and the fee's cap wait out its delay
+    /// @param owner_ the Robinhood timelock: the engine and the escape hatch wait out its delay
     constructor(IPoolManager poolManager_, address pool_, address owner_) BaseHook(poolManager_) {
         pool = pool_;
-        launcher = msg.sender;
         _initializeOwner(owner_);
     }
 
@@ -110,24 +94,9 @@ contract IMD6900Hook is BaseHook, Ownable {
         });
     }
 
-    /// @notice The fee a trade pays now, in hundredths of a bip: the schedule, under the timelock's cap
-    function currentFee() public view returns (uint24 fee) {
-        uint256 t = launchedAt;
-        if (t == 0) fee = FEE_START; // before the launch: what it opens at
-        else if (block.timestamp >= t + GLIDE) fee = FEE_AFTER;
-        else fee = uint24(FEE_START - (uint256(FEE_START - FEE_WEEK_END) * (block.timestamp - t)) / GLIDE);
-        if (fee > feeCap) fee = feeCap;
-    }
-
-    /// @notice The fee a swap by `sender` pays: none for the perps engine's own trades and the launch's opening buy
-    function feeFor(address sender) public view returns (uint24) {
-        if ((sender == perpEngine && sender != address(0)) || sender == launcher) return 0;
-        return currentFee();
-    }
-
-    /// @notice The trading fee in basis points now, for the perps engine's model
+    /// @notice The trading fee in basis points, for the perps engine's model: the pool's own, the same for everyone
     function feeBps() public view returns (uint256) {
-        return currentFee() / 100;
+        return ILockedPoolView(pool).fee() / 100;
     }
 
     /*                       OWNER (the Robinhood timelock)                  */
@@ -137,13 +106,6 @@ contract IMD6900Hook is BaseHook, Ownable {
     function setPerpEngine(address engine) external onlyOwner {
         perpEngine = engine;
         emit PerpEngineSet(engine);
-    }
-
-    /// @notice Caps the fee lower, for good: the cap only ever goes down
-    function lowerFee(uint24 cap) external onlyOwner {
-        if (cap >= feeCap) revert InvalidFee();
-        feeCap = cap;
-        emit FeeLowered(cap);
     }
 
     function setSweepFailOpen(bool on) external onlyOwner {
@@ -158,16 +120,17 @@ contract IMD6900Hook is BaseHook, Ownable {
 
     /*                              CALLBACKS                               */
 
-    /// @dev Only the locked pool, only once, only ETH / its coin with a dynamic fee, tick spacing 60, this hook
+    /// @dev Only the locked pool, only ETH / its coin at the locked pool's current static fee, tick spacing 60, this
+    ///      hook. The locked pool initializes once at the launch, then once per lower fee it moves to; the newest is
+    ///      the one served.
     function _beforeInitialize(address sender, PoolKey calldata key, uint160) internal override returns (bytes4) {
         if (sender != pool) revert OnlyPool();
         if (
-            PoolId.unwrap(poolId) != bytes32(0) || !key.currency0.isAddressZero()
-                || Currency.unwrap(key.currency1) != ILockedPoolView(pool).token()
-                || key.fee != LPFeeLibrary.DYNAMIC_FEE_FLAG || key.tickSpacing != TICK_SPACING
+            !key.currency0.isAddressZero() || Currency.unwrap(key.currency1) != ILockedPoolView(pool).token()
+                || LPFeeLibrary.isDynamicFee(key.fee) || key.fee != ILockedPoolView(pool).fee()
+                || key.tickSpacing != TICK_SPACING
         ) revert NotOurPool();
         poolId = key.toId();
-        launchedAt = block.timestamp;
         return BaseHook.beforeInitialize.selector;
     }
 
@@ -181,7 +144,8 @@ contract IMD6900Hook is BaseHook, Ownable {
         return BaseHook.beforeAddLiquidity.selector;
     }
 
-    /// @dev The locked pool never removes liquidity; it only collects its fees (a zero change, which v4 routes here)
+    /// @dev The locked pool takes liquidity out only to put it straight into its next, cheaper pool (in the same
+    ///      unlock), and otherwise only collects its fees (a zero change, which v4 routes here)
     function _beforeRemoveLiquidity(
         address sender,
         PoolKey calldata,
@@ -199,7 +163,7 @@ contract IMD6900Hook is BaseHook, Ownable {
     {
         if (PoolId.unwrap(key.toId()) != PoolId.unwrap(poolId)) revert NotOurPool();
         _sweep(sender, params.amountSpecified, params.zeroForOne, params.sqrtPriceLimitX96);
-        return (BaseHook.beforeSwap.selector, BeforeSwapDeltaLibrary.ZERO_DELTA, feeFor(sender) | LPFeeLibrary.OVERRIDE_FEE_FLAG);
+        return (BaseHook.beforeSwap.selector, BeforeSwapDeltaLibrary.ZERO_DELTA, 0);
     }
 
     /// @dev A second, best-effort sweep for anything the final price leaves under water

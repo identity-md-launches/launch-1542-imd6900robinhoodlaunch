@@ -5,8 +5,9 @@
 #
 #   script/launch.sh status        where everything stands
 #   script/launch.sh fund          the Pons launcher's ETH (the old pool's 2.83) back to the team wallet
-#   script/launch.sh deploy        the launch contract, from the team wallet (its constructor creates the pool and the hook)
+#   script/launch.sh deploy        the launch contract, from the team wallet (its constructor creates the pool)
 #   script/launch.sh use <addr>    or adopt the one the IMD swarm deployed (checked: the team wallet's, this source, unlaunched)
+#   script/launch.sh hook          the hook: its salt mined for this launch (cast create2), then createHook(salt)
 #   script/launch.sh claims        the claim list (script/claims.py: live balances capped at the snapshot), deadline in 120 days
 #   script/launch.sh queue-claims  queues the timelock's IMDSTR.setDistributor(<launch>, true): claims open 12h later
 #   script/launch.sh open-claims   executes it once ready (anyone with the executor role; the team wallet has it)
@@ -42,6 +43,9 @@ m() { python3 -c "print(f'{$1/1e24:.2f}M')"; }
 claims_data() { cast calldata 'setDistributor(address,bool)' "$LAUNCH" true; }
 claims_op() { c $TL 'hashOperation(address,uint256,bytes,bytes32,bytes32)(bytes32)' $IMDSTR 0 "$(claims_data)" $ZERO "$CLAIMS_SALT"; }
 need() { [ -n "${!1:-}" ] || { echo "no $1 yet: run '$2' first"; exit 1; }; }
+# launch() buys with every wei the launch holds: anything already there would push the price past Ethereum's
+emptied() { [ "$(cast balance $LAUNCH --rpc-url "$RPC")" = 0 ] || { echo "the launch holds ETH already: the owner's withdrawEth first, so the buy is exactly params.py's"; exit 1; }; }
+hooked() { [ "$(c $LAUNCH 'hook()(address)')" != 0x0000000000000000000000000000000000000000 ] || { echo "no hook yet: run 'hook' first"; exit 1; }; }
 key() { security find-generic-password -s PROGRAMMABLE_API_KEY -w; }
 
 case "${1:-status}" in
@@ -75,9 +79,24 @@ case "${1:-status}" in
     [ "$(cast code $(c $L 'pool()(address)') --rpc-url "$RPC" | cut -c1-200)" = "$WANT" ] || echo "warning: its pool's code starts differently from this source (the swarm adapted it?): programmable will check every byte"
     save LAUNCH "$L"; echo "using the swarm's launch $LAUNCH · pool $(c $L 'pool()(address)') · hook $(c $L 'hook()(address)')"
     ;;
+  hook)
+    need LAUNCH deploy
+    H=$(c $LAUNCH 'hook()(address)')
+    [ "$H" = 0x0000000000000000000000000000000000000000 ] || { echo "hook: $H"; exit 0; }
+    IH=$(c $LAUNCH 'hookInitCodeHash()(bytes32)')
+    # the low 14 bits are the hook's permissions, FLAGS = 0x2ac0 (ending in 2ac0 also fixes the next two bits: 4x the
+    # work, still instant); Uniswap reviews 0x91… hooks by hand, so those are mined again
+    while :; do
+      OUT=$(cast create2 --ends-with 2ac0 --deployer "$LAUNCH" --init-code-hash "$IH")
+      A=$(echo "$OUT" | awk '/^Address:/{print $2}'); S=$(echo "$OUT" | awk '/^Salt:/{print $2}')
+      [ "$(echo "$A" | cut -c3-4 | tr A-F a-f)" != 91 ] && break
+    done
+    tx $LAUNCH 'createHook(bytes32)' "$S" --gas-limit 2000000
+    echo "hook $(c $LAUNCH 'hook()(address)') (salt $S)"
+    ;;
   claims)
     need LAUNCH deploy
-    python3 script/claims.py --out claims.json
+    ROBINHOOD_RPC_URL="$RPC" python3 script/claims.py --out claims.json
     ROOT=$(python3 -c "import json;print(json.load(open('claims.json'))['root'])"); TOTAL=$(python3 -c "import json;print(json.load(open('claims.json'))['total'])")
     NOW=$(cast block latest --field timestamp --rpc-url "$RPC")
     tx $LAUNCH 'setClaims(bytes32,uint256,uint256)' $ROOT $TOTAL $((NOW + 120 * 86400)) && echo "claims set: $(m $TOTAL), until $(date -r $((NOW + 120 * 86400)))"
@@ -99,16 +118,16 @@ case "${1:-status}" in
     echo "the coin will be $TOKEN"
     ;;
   direct)
-    need LAUNCH deploy; need TOKEN mine
+    need LAUNCH deploy; need TOKEN mine; hooked; emptied
     [ "$(c $LAUNCH 'claimTotal()(uint256)')" != 0 ] || { echo "no claim list: run claims first"; exit 1; }
     python3 script/params.py --buy "$BUY_ETH" > params.json
     SP=$(python3 -c "import json;print(json.load(open('params.json'))['sqrtPriceX96'])"); MIN=$(python3 -c "import json;print(json.load(open('params.json'))['minBought'])"); V=$(python3 -c "import json;print(json.load(open('params.json'))['buyWei'])")
-    echo "launching $TOKEN: opens at $(python3 -c "import json;print(round(json.load(open('params.json'))['openMarketCapEth'],2))") ETH market cap, buys with $BUY_ETH ETH"
+    echo "launching $TOKEN: $(python3 -c "import json;p=json.load(open('params.json'));print(f\"opens at {p['openMarketCapEth']:.2f} ETH market cap, buys with {int(p['buyWei'])/1e18:.4f} ETH, lands at {p['afterMarketCapEthOn1B']:.2f} (Ethereum's)\")")"
     tx $LAUNCH 'launch(bytes32,address,uint160,uint256,address)' $SALT $TOKEN $SP $MIN $LAUNCH --value $V --gas-limit 4000000
     echo "live: $(c $LAUNCH 'token()(address)') · bought $(m $(c $LAUNCH 'launchBought()(uint256)')) · kept for the timelock $(m $(c $LAUNCH 'excessHeld()(uint256)'))"
     ;;
   programmable)
-    need LAUNCH deploy; need TOKEN mine
+    need LAUNCH deploy; need TOKEN mine; hooked; emptied
     if [ ! -f "$PACKER" ]; then mkdir -p "$(dirname "$PACKER")"; curl -sS -m 120 "$API/custom-launch-contract/request-packer.mjs" -o "$PACKER"; fi
     grep -q "sha256:3cd25308629f932d6a75e4a7694e6bcb67e4471fd2c1782d3b11ba5a7e3f8b61" "$PACKER" || { echo "the packer is for another manifest: refetch it and check the plan"; exit 1; }
     python3 script/params.py --buy "$BUY_ETH" > params.json

@@ -4,6 +4,8 @@ pragma solidity ^0.8.26;
 import {Test} from "forge-std/Test.sol";
 import {IPoolManager} from "@uniswap/v4-core/src/interfaces/IPoolManager.sol";
 import {PoolKey} from "@uniswap/v4-core/src/types/PoolKey.sol";
+import {PoolIdLibrary} from "@uniswap/v4-core/src/types/PoolId.sol";
+import {StateLibrary} from "@uniswap/v4-core/src/libraries/StateLibrary.sol";
 import {Currency} from "@uniswap/v4-core/src/types/Currency.sol";
 import {BalanceDelta} from "@uniswap/v4-core/src/types/BalanceDelta.sol";
 import {SwapParams} from "@uniswap/v4-core/src/types/PoolOperation.sol";
@@ -11,6 +13,7 @@ import {TickMath} from "@uniswap/v4-core/src/libraries/TickMath.sol";
 import {FullMath} from "@uniswap/v4-core/src/libraries/FullMath.sol";
 import {IMD6900RobinhoodLaunch} from "../src/IMD6900RobinhoodLaunch.sol";
 import {IMD6900LockedPool} from "../src/IMD6900LockedPool.sol";
+import {HookSalt} from "./HookSalt.sol";
 
 interface IERC20 {
     function balanceOf(address) external view returns (uint256);
@@ -64,6 +67,9 @@ contract ForkTrader {
 /// IMDSTR (it moves only to and from distributors, so the timelock's op is played first), the real pot bridge, real
 /// snapshot holders claiming, and a buy through Uniswap's own Universal Router: the pool is routable as deployed.
 contract RobinhoodForkTest is Test {
+    using PoolIdLibrary for PoolKey;
+    using StateLibrary for IPoolManager;
+
     IPoolManager constant PM = IPoolManager(0x8366a39CC670B4001A1121B8F6A443A643e40951);
     IImdstr constant IMDSTR = IImdstr(0x0000198C940D8cD70Cb9ACeC5E3af8216ac57d2F);
     address constant TL = 0x16D3f65B708883DF042d98E1C7a49B32A33E2A14;
@@ -84,6 +90,7 @@ contract RobinhoodForkTest is Test {
         vm.createSelectFork(rpc);
         live = true;
         L = new IMD6900RobinhoodLaunch(TEAM, PM, address(IMDSTR), TL);
+        L.createHook(HookSalt.mine(L));
     }
 
     function test_TheWholeLaunchOnRobinhood() public {
@@ -96,10 +103,10 @@ contract RobinhoodForkTest is Test {
         vm.prank(TEAM);
         L.setClaims(root, b1 + b2, block.timestamp + 91 days);
 
-        // the launch: Ethereum's ~25 ETH market cap after a 2.81 ETH buy
+        // the launch: Ethereum's ~25 ETH market cap after a 2.81 ETH buy (4.44% of it the pool's fee)
         vm.deal(TEAM, 2.81 ether);
         address expected = L.tokenAddress(bytes32(0));
-        uint160 sp = uint160(_sqrt(FullMath.mulDiv(SUPPLY, 1 << 192, 19.18 ether)));
+        uint160 sp = uint160(_sqrt(FullMath.mulDiv(SUPPLY, 1 << 192, 19.40 ether)));
         vm.prank(TEAM);
         (address t, uint256 bought) = L.launch{value: 2.81 ether}(bytes32(0), expected, sp, 0, address(0));
         emit log_named_decimal_uint("opening buy, coins", bought, 18);
@@ -131,17 +138,10 @@ contract RobinhoodForkTest is Test {
         tr.swap(k, false, -int256(coins));
         assertEq(IERC20(t).balanceOf(address(tr)), 0);
 
-        // and through Uniswap's Universal Router: V4_SWAP (SWAP_EXACT_IN_SINGLE, SETTLE_ALL, TAKE_ALL)
+        // and through Uniswap's Universal Router
         address buyer = address(0xB0B);
         vm.deal(buyer, 1 ether);
-        bytes[] memory params = new bytes[](3);
-        params[0] = abi.encode(ExactInputSingleParams(k, true, uint128(0.5 ether), 0, ""));
-        params[1] = abi.encode(k.currency0, uint256(0.5 ether));
-        params[2] = abi.encode(k.currency1, uint256(0));
-        bytes[] memory inputs = new bytes[](1);
-        inputs[0] = abi.encode(abi.encodePacked(uint8(0x06), uint8(0x0c), uint8(0x0f)), params);
-        vm.prank(buyer);
-        UR.execute{value: 0.5 ether}(hex"10", inputs, block.timestamp + 60);
+        _routerBuy(buyer, k, 0.5 ether);
         emit log_named_decimal_uint("bought through the Universal Router", IERC20(t).balanceOf(buyer), 18);
         assertGt(IERC20(t).balanceOf(buyer), 0, "Uniswap's router trades the pool");
 
@@ -160,9 +160,41 @@ contract RobinhoodForkTest is Test {
         uint256 got = L.burnImd(0);
         emit log_named_decimal_uint("$IMD bought for the burn executor", got, 18);
         assertEq(IERC20(L.IMD()).balanceOf(exec) - execBefore, got);
-        (,, uint128 inPool) = pool.state();
+        (uint160 sq1,, uint128 inPool) = pool.state();
         assertEq(pool.liquidity(), locked, "the position never moved");
         assertEq(inPool, locked, "and it is all the pool has");
+
+        // the timelock lowers the fee: the position moves to a 3.33% pool at the same price, in one transaction
+        uint256 potBefore2 = POT.balance;
+        vm.prank(TL);
+        uint128 moved = pool.lowerFee(33_300);
+        PoolKey memory k2 = pool.poolKey();
+        assertEq(k2.fee, 33_300);
+        (uint160 sq2,, uint128 inPool2) = pool.state();
+        assertEq(sq2, sq1, "same price");
+        assertEq(inPool2, moved);
+        assertApproxEqRel(moved, locked, 1e9, "all of it, to the wei of rounding");
+        assertEq(PM.getLiquidity(k.toId()), 0, "the 4.44% pool is empty");
+        uint256 before2 = IERC20(t).balanceOf(buyer);
+        _routerBuy(buyer, k2, 0.5 ether);
+        emit log_named_decimal_uint("bought through the Universal Router at 3.33%", IERC20(t).balanceOf(buyer) - before2, 18);
+        assertGt(IERC20(t).balanceOf(buyer), before2, "Uniswap's router trades the new pool");
+        vm.expectRevert();
+        tr.swap(k, true, -0.1 ether);
+        L.harvest();
+        assertGt(POT.balance, potBefore2, "the new pool's fees reach the pot");
+    }
+
+    /// @dev V4_SWAP (SWAP_EXACT_IN_SINGLE, SETTLE_ALL, TAKE_ALL), ETH in
+    function _routerBuy(address buyer, PoolKey memory k, uint256 amount) internal {
+        bytes[] memory params = new bytes[](3);
+        params[0] = abi.encode(ExactInputSingleParams(k, true, uint128(amount), 0, ""));
+        params[1] = abi.encode(k.currency0, amount);
+        params[2] = abi.encode(k.currency1, uint256(0));
+        bytes[] memory inputs = new bytes[](1);
+        inputs[0] = abi.encode(abi.encodePacked(uint8(0x06), uint8(0x0c), uint8(0x0f)), params);
+        vm.prank(buyer);
+        UR.execute{value: amount}(hex"10", inputs, block.timestamp + 60);
     }
 
     function _sqrt(uint256 x) internal pure returns (uint256 y) {
