@@ -6,3 +6,9 @@ plan.json
 params.json
 request.canonical.json
 pack-report.json
+launch.state
+claims.json
+submitted.json
+preflight.json
+review.json
+.programmable/

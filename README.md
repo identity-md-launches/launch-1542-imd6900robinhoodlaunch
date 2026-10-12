@@ -47,16 +47,19 @@ ROBINHOOD_RPC_URL=https://rpc.mainnet.chain.robinhood.com forge test --match-con
 The fork test runs the whole thing on live Robinhood state: the real PoolManager, IMDSTR (claims after the timelock's
 distributor op), the pot bridge, $IMD's pool and burn executor, and a buy through Uniswap's Universal Router.
 
-## Runbook
+## Runbook: `script/launch.sh`
 
-1. **The swarm deploys** `IMD6900RobinhoodLaunch(owner, poolManager, imdstr, timelock)` (`jobs/swarm-launch.json`).
-2. **ETH**: the Pons launcher's 2.83 ETH back to the team wallet (`withdrawEth(team, 0)` on `0xE0aB…6Ba0`).
-3. **Claims**: `python3 script/claims.py` (live balances, capped at the snapshot) → `setClaims(root, total, deadline)`;
-   queue the timelock's `IMDSTR.setDistributor(<launch>, true)` (12h) so claims open right after the launch.
-4. **The address**: `LAUNCH=<launch> script/mine.sh` → salt and 0x6900… address.
-5. **The plan**: `python3 script/params.py > params.json`, then
-   `python3 script/programmable_plan.py --launch <launch> --salt <salt> --token <0x6900…> --params params.json`
-   (it recompiles the exact source with solc 0.8.26 and refuses unless every deployed runtime matches byte for byte),
-   then Programmable's packer, preflight and create (the API key from the keychain, never in a file).
-6. **Programmable's review** (manual, up to 24h), then the team wallet signs `launch` in the approved 24h window, then
-   the stamp.
+The contracts don't depend on Programmable: the last step decides between launching straight on Uniswap and launching
+through Programmable (the same `launch()`, after their review, with their stamp and listing). Each step signs with the
+team wallet's keystore (`imdstr-deployer`); `script/launch.sh status` shows where things stand.
+
+1. `fund`: the Pons launcher's 2.83 ETH back to the team wallet.
+2. `deploy`: the launch contract (its constructor creates the locked pool and mines the hook).
+3. `claims`: the claim list from live balances capped at the snapshot (35 holders, ~63.9M), deadline in 120 days.
+4. `queue-claims`, then `open-claims` 12h later: the timelock makes the launch an IMDSTR distributor.
+5. `mine`: the coin's 0x6900… address for this launch.
+6. Either `direct` (live on Uniswap in one transaction), or `programmable` (plan built from the exact source, packed with
+   Programmable's packer, preflighted), `submit` (their manual review, up to 24h), `review`, then the team wallet signs
+   `launch` in the approved 24h window, then the stamp.
+
+Rehearsed end to end, both ways, on forks of Robinhood (`SIGN_ARGS="--unlocked --from <team>" RPC=<fork>`).
