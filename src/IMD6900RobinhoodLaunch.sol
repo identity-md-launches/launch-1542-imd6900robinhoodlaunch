@@ -1,0 +1,426 @@
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.26;
+
+import {Ownable} from "solady/auth/Ownable.sol";
+import {ReentrancyGuard} from "solady/utils/ReentrancyGuard.sol";
+import {SafeTransferLib} from "solady/utils/SafeTransferLib.sol";
+import {IPoolManager} from "@uniswap/v4-core/src/interfaces/IPoolManager.sol";
+import {Hooks} from "@uniswap/v4-core/src/libraries/Hooks.sol";
+import {TickMath} from "@uniswap/v4-core/src/libraries/TickMath.sol";
+import {PoolKey} from "@uniswap/v4-core/src/types/PoolKey.sol";
+import {Currency} from "@uniswap/v4-core/src/types/Currency.sol";
+import {IHooks} from "@uniswap/v4-core/src/interfaces/IHooks.sol";
+import {BalanceDelta} from "@uniswap/v4-core/src/types/BalanceDelta.sol";
+import {SwapParams} from "@uniswap/v4-core/src/types/PoolOperation.sol";
+import {IMD6900} from "./IMD6900.sol";
+import {IMD6900Hook} from "./IMD6900Hook.sol";
+import {IMD6900LockedPool} from "./IMD6900LockedPool.sol";
+
+/// @title IMD6900RobinhoodLaunch - Identity.MD 6900 (IMD6900) on Robinhood Chain: the coin, its locked Uniswap v4 pool
+///        with the perps hook, the opening buy, the 1:1 claim for the old IMDSTR, the fee split
+/// @notice Deployed by the IMD swarm. Its constructor creates the locked pool and the hook (at an address it mines to
+///         carry exactly the hook's permissions, never 0x91…, so Uniswap routes the pool on its own) and calls nothing
+///         that existed before it. Then:
+///          1. the team sends the opening buy's ETH (or sends it with {launch}); {withdrawEth} takes it back until then;
+///          2. the owner sets the claim list ({setClaims}: a Merkle root of the snapshot's IMDSTR balances) and mines
+///             the coin's vanity address for THIS contract (it deploys the coin with CREATE2);
+///          3. {launch}, one transaction, so nobody trades before it: the coin (1B, minted here), the pool opened with
+///             all of it as IMD6900-only liquidity from the opening price down (no ETH needed, locked for good), the
+///             opening buy with every wei held here, the claims' reserve kept, the rest burned or sent on.
+///         Claims: IMDSTR in, IMD6900 out, 1:1, up to each holder's snapshot balance. IMDSTR moves only to and from
+///         Robinhood distributors, so claiming opens once the Robinhood timelock makes this contract one.
+///         Fees: the pool's 1% accrues to its locked position. {harvest} (anyone) collects it (the IMD6900 part is
+///         burned by the pool) and splits the ETH: 70% to the pot bridge (Ethereum's NFT pot), 10% to $IMD's burn,
+///         20% ops, until the owner sets other payees. The $IMD share is kept here and {burnImd} (anyone) spends it,
+///         at most {IMD_BUY_MAX} a call, buying $IMD on its Robinhood pool for IMD's official burn executor there,
+///         which bridges it to Base to be destroyed. After the launch, ETH leaves only through the split, the $IMD
+///         buys, or the timelock's {recoverEth}.
+contract IMD6900RobinhoodLaunch is Ownable, ReentrancyGuard {
+    /// @dev beforeInitialize, beforeAddLiquidity, beforeRemoveLiquidity, beforeSwap, afterSwap: no return deltas, no
+    ///      dynamic fee, nothing that would cost the pool Uniswap's automatic routing
+    uint160 public constant FLAGS = Hooks.BEFORE_INITIALIZE_FLAG | Hooks.BEFORE_ADD_LIQUIDITY_FLAG
+        | Hooks.BEFORE_REMOVE_LIQUIDITY_FLAG | Hooks.BEFORE_SWAP_FLAG | Hooks.AFTER_SWAP_FLAG;
+    /// @notice The pool's static fee, hundredths of a bip: 1%
+    uint24 public constant POOL_FEE = 10_000;
+    uint256 public constant SUPPLY = 1_000_000_000 ether;
+    /// @notice PonsPotBridge on Robinhood: bridges ETH (Across) to the Ethereum launch hook, which feeds IMD6900's NFT pot
+    address public constant POT_BRIDGE = 0xc39e650a24985C2bBA9FD83C81041B8f3E3f9EDd;
+    uint16 public constant POT_BPS = 7_000;
+    /// @notice $IMD (Identity.md) on Robinhood Chain, and its official burn executor there (it bridges what it holds to
+    ///         IMD's burn receiver on Base). As a payee, the executor's share buys $IMD rather than being sent as ETH.
+    address public constant IMD = 0x5F7Bb59365ce557C26dbcAa4EE9d39A4b95B7127;
+    address public constant IMD_BURN = 0x4D6537ec564aFf82eABb1Ce5f355E817cBEA1e07;
+    uint16 public constant IMD_BPS = 1_000;
+    /// @notice The most one {burnImd} spends: under what sandwiching it would be worth through two 1% fees
+    uint256 public constant IMD_BUY_MAX = 0.1 ether;
+    uint256 public constant MAX_PAYEES = 8;
+    /// @notice Claims stay open at least this long after the launch before the unclaimed reserve can be released
+    uint256 public constant MIN_CLAIM_WINDOW = 90 days;
+    /// @dev One salt in ~16,450 fits on average; a million tries leave a miss at about e^-63
+    uint256 internal constant MAX_TRIES = 1 << 20;
+
+    IPoolManager public immutable poolManager;
+    IMD6900LockedPool public immutable pool;
+    IMD6900Hook public immutable hook;
+    bytes32 public immutable hookSalt;
+    /// @notice Robinhood's IMDSTR, the old token that claims IMD6900 1:1
+    address public immutable imdstr;
+    /// @notice The Robinhood timelock: owns the hook, and is the one way ETH leaves after the launch besides the split
+    address public immutable timelock;
+
+    /// @notice IMD6900, once launched
+    address public token;
+    uint256 public launchEth;
+    uint256 public launchBought;
+    /// @notice What the opening buy landed beyond the claims' reserve: burned, or sent where the launch said
+    uint256 public launchExcess;
+
+    /// @notice The claim list: a Merkle root of (account, IMDSTR balance) at the snapshot, their sum, and when the
+    ///         unclaimed rest may be released. Set before the launch, fixed after.
+    bytes32 public claimRoot;
+    uint256 public claimTotal;
+    uint256 public claimDeadline;
+    uint256 public claimedTotal;
+    bool public unclaimedReleased;
+    mapping(address => uint256) public claimedBy;
+
+    /// @notice ETH set aside for $IMD's burn, spent by {burnImd}; and what it has bought and sent so far
+    uint256 public imdBucket;
+    uint256 public imdBurned;
+    /// @notice $IMD's Robinhood pool: ETH / $IMD at this fee, tick spacing and hooks (the timelock may repoint it)
+    uint24 public imdPoolFee = 10_000;
+    int24 public imdPoolTickSpacing = 100;
+    address public imdPoolHooks;
+
+    /// @dev The owner's payees once set (fixed-size); until then 70% the pot bridge, 10% $IMD's burn, 20% the owner
+    address[8] internal _payees;
+    uint16[8] internal _shares;
+    uint8 internal _payeeCount;
+
+    event ClaimsSet(bytes32 root, uint256 total, uint256 deadline);
+    event EthWithdrawn(address to, uint256 amount);
+    event Launched(address token, uint160 sqrtPriceX96, int24 upperTick, uint256 ethSpent, uint256 bought, uint256 excess, address excessTo);
+    event Claimed(address indexed account, uint256 amount);
+    event UnclaimedReleased(address to, uint256 amount);
+    event ImdstrReleased(address to, uint256 amount);
+    event FeesReceived(address indexed from, uint256 amount);
+    event Split(uint256 amount);
+    event PayFailed(address payee, uint256 amount);
+    event PayeesSet(address[] payees, uint16[] shares);
+    event EthRecovered(address to, uint256 amount);
+    event ImdBurned(uint256 ethIn, uint256 imd);
+    event ImdPoolSet(uint24 fee, int24 tickSpacing, address hooks);
+
+    error NoSalt();
+    error BadHook();
+    error AlreadyLaunched();
+    error NotLaunched();
+    error NoEth();
+    error NotWhereMined(address token);
+    error Short(uint256 bought);
+    error BadClaims();
+    error BadProof();
+    error OverClaim();
+    error ZeroAmount();
+    error ClaimsOpen();
+    error AlreadyReleased();
+    error BadPayees();
+    error NotTimelock();
+    error OnlyPoolManager();
+
+    /// @param owner_       the team wallet: launches, sets the claim list and the payees
+    /// @param poolManager_ Uniswap v4's PoolManager on Robinhood Chain
+    /// @param imdstr_      Robinhood's IMDSTR
+    /// @param timelock_    the Robinhood timelock: the hook's owner, and {recoverEth}
+    constructor(address owner_, IPoolManager poolManager_, address imdstr_, address timelock_) {
+        _initializeOwner(owner_);
+        poolManager = poolManager_;
+        imdstr = imdstr_;
+        timelock = timelock_;
+        IMD6900LockedPool p = new IMD6900LockedPool(poolManager_, POOL_FEE, address(this));
+        bytes memory init =
+            abi.encodePacked(type(IMD6900Hook).creationCode, abi.encode(poolManager_, address(p), timelock_, POOL_FEE));
+        bytes32 s = _mine(keccak256(init));
+        address h;
+        assembly ("memory-safe") {
+            h := create2(0, add(init, 0x20), mload(init), s)
+        }
+        if (h == address(0) || uint160(h) & Hooks.ALL_HOOK_MASK != FLAGS || uint160(h) >> 152 == 0x91) revert BadHook();
+        p.setHook(h);
+        pool = p;
+        hook = IMD6900Hook(h);
+        hookSalt = s;
+    }
+
+    /// @notice Before the launch, the opening buy's ETH (anyone may send it, only the owner takes it back); after, fees
+    receive() external payable {}
+
+    /// @notice The pool's ETH fees (IMD6900LockedPool.collect)
+    function addFees() external payable {
+        emit FeesReceived(msg.sender, msg.value);
+    }
+
+    /// @notice The coin's address for `salt`: what the owner mines a vanity salt against
+    function tokenAddress(bytes32 salt) public view returns (address) {
+        bytes32 h = keccak256(
+            abi.encodePacked(
+                bytes1(0xff), address(this), salt, keccak256(abi.encodePacked(type(IMD6900).creationCode, abi.encode(address(this))))
+            )
+        );
+        return address(uint160(uint256(h)));
+    }
+
+    /// @notice keccak256 of the coin's creation code with its constructor argument: the init code hash to mine against
+    function tokenInitCodeHash() external view returns (bytes32) {
+        return keccak256(abi.encodePacked(type(IMD6900).creationCode, abi.encode(address(this))));
+    }
+
+    function payees() public view returns (address[] memory to, uint16[] memory bps) {
+        uint256 n = _payeeCount;
+        if (n == 0) {
+            (to, bps) = (new address[](3), new uint16[](3));
+            (to[0], bps[0], to[1], bps[1]) = (POT_BRIDGE, POT_BPS, IMD_BURN, IMD_BPS);
+            (to[2], bps[2]) = (owner(), 10_000 - POT_BPS - IMD_BPS);
+            return (to, bps);
+        }
+        (to, bps) = (new address[](n), new uint16[](n));
+        for (uint256 i; i < n; ++i) (to[i], bps[i]) = (_payees[i], _shares[i]);
+    }
+
+    /// @notice What is still reserved for claims
+    function claimReserve() public view returns (uint256) {
+        return unclaimedReleased ? 0 : claimTotal - claimedTotal;
+    }
+
+    /*                                 OWNER                                */
+
+    /// @notice The claim list, before the launch: `root` over leaves keccak256(keccak256(abi.encode(account, amount))),
+    ///         `total` their sum (the reserve the opening buy must cover), `deadline` when the unclaimed rest may be
+    ///         released (at least {MIN_CLAIM_WINDOW} after the launch; checked then)
+    function setClaims(bytes32 root, uint256 total, uint256 deadline) external onlyOwner {
+        if (token != address(0)) revert AlreadyLaunched();
+        if ((root == bytes32(0)) != (total == 0)) revert BadClaims();
+        (claimRoot, claimTotal, claimDeadline) = (root, total, deadline);
+        emit ClaimsSet(root, total, deadline);
+    }
+
+    /// @notice Sends ETH held here to `to` (all of it with 0): the way out of a launch the team decides against.
+    ///         Before the launch only.
+    function withdrawEth(address to, uint256 amount) external onlyOwner nonReentrant {
+        if (token != address(0)) revert AlreadyLaunched();
+        if (amount == 0) amount = address(this).balance;
+        if (amount == 0) revert NoEth();
+        SafeTransferLib.safeTransferETH(to, amount);
+        emit EthWithdrawn(to, amount);
+    }
+
+    /// @notice The launch, in one transaction: creates the coin at the CREATE2 address `salt` gives (reverts unless
+    ///         it is `expectedToken`), opens the pool at `sqrtPriceX96` (coin per ETH, rounded down onto a tick) with
+    ///         the whole supply, buys with every wei held here (the ETH sent included), keeps the claims' reserve and
+    ///         burns the rest (`excessTo` zero) or sends it to `excessTo`.
+    /// @param minBought the opening buy's floor; it must cover the claims' reserve in any case
+    function launch(bytes32 salt, address expectedToken, uint160 sqrtPriceX96, uint256 minBought, address excessTo)
+        external
+        payable
+        onlyOwner
+        nonReentrant
+        returns (address t, uint256 bought)
+    {
+        if (token != address(0)) revert AlreadyLaunched();
+        if (claimTotal != 0 && claimDeadline < block.timestamp + MIN_CLAIM_WINDOW) revert BadClaims();
+        t = address(new IMD6900{salt: salt}(address(this)));
+        if (t != expectedToken) revert NotWhereMined(t);
+        token = t;
+
+        SafeTransferLib.safeApprove(t, address(pool), SUPPLY);
+        pool.open(t, sqrtPriceX96, SUPPLY);
+
+        uint256 spend = address(this).balance;
+        if (spend == 0) revert NoEth();
+        bought = abi.decode(poolManager.unlock(abi.encode(uint8(0), spend)), (uint256));
+        if (bought < minBought || bought < claimTotal) revert Short(bought);
+
+        uint256 excess = SafeTransferLib.balanceOf(t, address(this)) - claimTotal; // the opening's rounding dust included
+        if (excess != 0) {
+            if (excessTo == address(0)) IMD6900(t).burn(excess);
+            else SafeTransferLib.safeTransfer(t, excessTo, excess);
+        }
+        (launchEth, launchBought, launchExcess) = (spend, bought, excess);
+        emit Launched(t, sqrtPriceX96, pool.upperTick(), spend, bought, excess, excessTo);
+    }
+
+    /// @notice After the claim deadline, the unclaimed reserve: burned (`to` zero) or sent to `to`. Once.
+    function releaseUnclaimed(address to) external onlyOwner nonReentrant {
+        if (token == address(0)) revert NotLaunched();
+        if (block.timestamp < claimDeadline) revert ClaimsOpen();
+        if (unclaimedReleased) revert AlreadyReleased();
+        uint256 amount = claimTotal - claimedTotal;
+        unclaimedReleased = true;
+        if (amount != 0) {
+            if (to == address(0)) IMD6900(token).burn(amount);
+            else SafeTransferLib.safeTransfer(token, to, amount);
+        }
+        emit UnclaimedReleased(to, amount);
+    }
+
+    /// @notice The IMDSTR the claims collected (all of it with 0), to `to`: home to Ethereum, where it is IMD6900
+    function releaseImdstr(uint256 amount, address to) external onlyOwner nonReentrant {
+        uint256 held = SafeTransferLib.balanceOf(imdstr, address(this));
+        if (amount == 0) amount = held;
+        if (amount == 0 || amount > held) revert ZeroAmount();
+        SafeTransferLib.safeTransfer(imdstr, to, amount);
+        emit ImdstrReleased(to, amount);
+    }
+
+    /// @notice Who the ETH fees are split to: up to {MAX_PAYEES}, shares in basis points summing to 10,000
+    function setPayees(address[] calldata to, uint16[] calldata bps) external onlyOwner {
+        uint256 n = to.length;
+        if (n == 0 || n > MAX_PAYEES || n != bps.length) revert BadPayees();
+        uint256 sum;
+        for (uint256 i; i < n; ++i) {
+            if (to[i] == address(0)) revert BadPayees();
+            (_payees[i], _shares[i]) = (to[i], bps[i]);
+            sum += bps[i];
+        }
+        if (sum != 10_000) revert BadPayees();
+        _payeeCount = uint8(n);
+        emit PayeesSet(to, bps);
+    }
+
+    /*                        THE ROBINHOOD TIMELOCK                        */
+
+    /// @notice Sends ETH held here to `to` (all of it with 0), at any time, behind the timelock's delay: the escape
+    ///         hatch for the fees (a payee that refused its share, a split to stop)
+    function recoverEth(address to, uint256 amount) external nonReentrant {
+        if (msg.sender != timelock) revert NotTimelock();
+        if (amount == 0) amount = address(this).balance;
+        if (amount == 0) revert NoEth();
+        SafeTransferLib.safeTransferETH(to, amount);
+        if (imdBucket > address(this).balance) imdBucket = address(this).balance;
+        emit EthRecovered(to, amount);
+    }
+
+    /// @notice Repoints $IMD's buys to another of its Robinhood pools (ETH / $IMD), behind the timelock's delay
+    function setImdPool(uint24 fee, int24 tickSpacing, address hooks) external {
+        if (msg.sender != timelock) revert NotTimelock();
+        (imdPoolFee, imdPoolTickSpacing, imdPoolHooks) = (fee, tickSpacing, hooks);
+        emit ImdPoolSet(fee, tickSpacing, hooks);
+    }
+
+    /*                                ANYONE                                */
+
+    /// @notice IMDSTR in, IMD6900 out, 1:1, up to the caller's snapshot balance `allowance` (approve IMDSTR first).
+    ///         The IMDSTR stays here.
+    function claim(uint256 amount, uint256 allowance, bytes32[] calldata proof) external nonReentrant {
+        if (token == address(0)) revert NotLaunched();
+        if (amount == 0) revert ZeroAmount();
+        if (unclaimedReleased) revert AlreadyReleased();
+        bytes32 leaf = keccak256(bytes.concat(keccak256(abi.encode(msg.sender, allowance))));
+        if (!_verify(proof, claimRoot, leaf)) revert BadProof();
+        uint256 done = claimedBy[msg.sender] + amount;
+        if (done > allowance) revert OverClaim();
+        claimedBy[msg.sender] = done;
+        claimedTotal += amount;
+        SafeTransferLib.safeTransferFrom(imdstr, msg.sender, address(this), amount);
+        SafeTransferLib.safeTransfer(token, msg.sender, amount);
+        emit Claimed(msg.sender, amount);
+    }
+
+    /// @notice Pays the ETH here (beyond what is set aside for $IMD) to the payees, pro rata; the burn executor's share
+    ///         is set aside for {burnImd} instead. After the launch only. A payee that refuses its share leaves it here
+    ///         for the next split.
+    function split() public nonReentrant returns (uint256 amount) {
+        if (token == address(0)) revert NotLaunched();
+        amount = address(this).balance - imdBucket;
+        if (amount == 0) return 0;
+        (address[] memory to, uint16[] memory bps) = payees();
+        for (uint256 i; i < to.length; ++i) {
+            uint256 part = (amount * bps[i]) / 10_000;
+            if (part == 0) continue;
+            if (to[i] == IMD_BURN) {
+                imdBucket += part;
+                continue;
+            }
+            (bool ok,) = to[i].call{value: part}("");
+            if (!ok) emit PayFailed(to[i], part);
+        }
+        emit Split(amount);
+    }
+
+    /// @notice Buys $IMD with what is set aside for its burn, at most {IMD_BUY_MAX} a call, and sends it to IMD's burn
+    ///         executor (anyone can then bridge it to Base, where it is destroyed). Anyone.
+    /// @param minImd the least $IMD the buy may return
+    function burnImd(uint256 minImd) external nonReentrant returns (uint256 imd) {
+        uint256 spend = imdBucket < IMD_BUY_MAX ? imdBucket : IMD_BUY_MAX;
+        if (spend == 0) revert NoEth();
+        imdBucket -= spend;
+        imd = abi.decode(poolManager.unlock(abi.encode(uint8(1), spend)), (uint256));
+        if (imd < minImd) revert Short(imd);
+        SafeTransferLib.safeTransfer(IMD, IMD_BURN, imd);
+        imdBurned += imd;
+        emit ImdBurned(spend, imd);
+    }
+
+    function imdPoolKey() public view returns (PoolKey memory) {
+        return PoolKey(Currency.wrap(address(0)), Currency.wrap(IMD), imdPoolFee, imdPoolTickSpacing, IHooks(imdPoolHooks));
+    }
+
+    /// @notice Collects the pool's fees (its IMD6900 burned, its ETH here) and splits the ETH
+    function harvest() external returns (uint256) {
+        pool.collect();
+        return split();
+    }
+
+    /*                            POOL MANAGER                              */
+
+    /// @dev A buy, ETH in, the other side out, as far as the price goes: the opening buy (0) on the coin's pool, or
+    ///      $IMD's burn (1) on its pool
+    function unlockCallback(bytes calldata data) external returns (bytes memory) {
+        if (msg.sender != address(poolManager)) revert OnlyPoolManager();
+        (uint8 what, uint256 spend) = abi.decode(data, (uint8, uint256));
+        PoolKey memory key = what == 0 ? pool.poolKey() : imdPoolKey();
+        BalanceDelta d = poolManager.swap(key, SwapParams(true, -int256(spend), TickMath.MIN_SQRT_PRICE + 1), "");
+        uint256 ethIn = uint256(uint128(-d.amount0()));
+        uint256 out = uint256(uint128(d.amount1()));
+        poolManager.settle{value: ethIn}();
+        poolManager.take(key.currency1, address(this), out);
+        return abi.encode(out);
+    }
+
+    /*                              INTERNAL                                */
+
+    /// @dev The first salt whose CREATE2 address from here carries exactly {FLAGS} in its low 14 bits and doesn't
+    ///      start with 0x91 (Uniswap reviews those by hand)
+    function _mine(bytes32 initHash) internal view returns (bytes32 s) {
+        address me = address(this);
+        uint256 flags = FLAGS;
+        uint256 tries = MAX_TRIES;
+        bool found;
+        assembly ("memory-safe") {
+            let ptr := mload(0x40)
+            mstore(ptr, me) // the address in bytes 12..31
+            mstore8(add(ptr, 11), 0xff) // 0xff ++ address ++ salt ++ initHash: 85 bytes from ptr + 11
+            mstore(add(ptr, 0x40), initHash)
+            for { let i := 0 } lt(i, tries) { i := add(i, 1) } {
+                mstore(add(ptr, 0x20), i)
+                let a := keccak256(add(ptr, 11), 85)
+                if and(eq(and(a, 0x3fff), flags), iszero(eq(and(shr(152, a), 0xff), 0x91))) {
+                    s := i
+                    found := 1
+                    break
+                }
+            }
+        }
+        if (!found) revert NoSalt();
+    }
+
+    /// @dev A Merkle proof over sorted pairs
+    function _verify(bytes32[] calldata proof, bytes32 root, bytes32 leaf) internal pure returns (bool) {
+        bytes32 h = leaf;
+        for (uint256 i; i < proof.length; ++i) {
+            bytes32 p = proof[i];
+            h = h < p ? keccak256(abi.encodePacked(h, p)) : keccak256(abi.encodePacked(p, h));
+        }
+        return h == root;
+    }
+}
