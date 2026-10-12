@@ -6,6 +6,7 @@
 #   script/launch.sh status        where everything stands
 #   script/launch.sh fund          the Pons launcher's ETH (the old pool's 2.83) back to the team wallet
 #   script/launch.sh deploy        the launch contract, from the team wallet (its constructor creates the pool and the hook)
+#   script/launch.sh use <addr>    or adopt the one the IMD swarm deployed (checked: the team wallet's, this source, unlaunched)
 #   script/launch.sh claims        the claim list (script/claims.py: live balances capped at the snapshot), deadline in 120 days
 #   script/launch.sh queue-claims  queues the timelock's IMDSTR.setDistributor(<launch>, true): claims open 12h later
 #   script/launch.sh open-claims   executes it once ready (anyone with the executor role; the team wallet has it)
@@ -63,6 +64,16 @@ case "${1:-status}" in
     L=$(cast send "${SIGN[@]}" --rpc-url "$RPC" --json --create "${INIT}${ARGS:2}" | python3 -c "import json,sys;print(json.load(sys.stdin)['contractAddress'])")
     save LAUNCH "$(cast to-check-sum-address "$L")"
     echo "launch $LAUNCH · pool $(c $LAUNCH 'pool()(address)') · hook $(c $LAUNCH 'hook()(address)')"
+    ;;
+  use)
+    [ -z "${LAUNCH:-}" ] || { echo "already using $LAUNCH"; exit 0; }
+    L=$(cast to-check-sum-address "${2:?the swarm's launch address}")
+    [ "$(c $L 'owner()(address)' | tr A-F a-f)" = "$(echo $TEAM | tr A-F a-f)" ] || { echo "$L isn't the team wallet's"; exit 1; }
+    [ "$(c $L 'token()(address)')" = 0x0000000000000000000000000000000000000000 ] || { echo "$L has launched already"; exit 1; }
+    forge build --silent
+    WANT=$(python3 -c "import json;print(json.load(open('out/IMD6900LockedPool.sol/IMD6900LockedPool.json'))['deployedBytecode']['object'][:200])")
+    [ "$(cast code $(c $L 'pool()(address)') --rpc-url "$RPC" | cut -c1-200)" = "$WANT" ] || echo "warning: its pool's code starts differently from this source (the swarm adapted it?): programmable will check every byte"
+    save LAUNCH "$L"; echo "using the swarm's launch $LAUNCH · pool $(c $L 'pool()(address)') · hook $(c $L 'hook()(address)')"
     ;;
   claims)
     need LAUNCH deploy
