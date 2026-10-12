@@ -67,7 +67,7 @@ case "${1:-status}" in
     ;;
   use)
     [ -z "${LAUNCH:-}" ] || { echo "already using $LAUNCH"; exit 0; }
-    L=$(cast to-check-sum-address "${2:?the swarm's launch address}")
+    L=$(cast to-check-sum-address "${2:?give the launch address the swarm deployed}")
     [ "$(c $L 'owner()(address)' | tr A-F a-f)" = "$(echo $TEAM | tr A-F a-f)" ] || { echo "$L isn't the team wallet's"; exit 1; }
     [ "$(c $L 'token()(address)')" = 0x0000000000000000000000000000000000000000 ] || { echo "$L has launched already"; exit 1; }
     forge build --silent
