@@ -371,6 +371,27 @@ contract IMD6900RobinhoodLaunchTest is Test {
         t;
     }
 
+    function test_OnlyTheTimelockSetsTheSplit() public {
+        address[] memory to = new address[](2);
+        uint16[] memory bps = new uint16[](2);
+        (to[0], bps[0], to[1], bps[1]) = (POT, 9_000, L.IMD_BURN(), 1_000);
+        vm.prank(OWNER);
+        vm.expectRevert(IMD6900RobinhoodLaunch.NotTimelock.selector);
+        L.setPayees(to, bps);
+        vm.prank(TL);
+        L.setPayees(to, bps);
+        (address[] memory got, uint16[] memory gotBps) = L.payees();
+        assertEq(got.length, 2);
+        assertEq(gotBps[0], 9_000);
+        // and the new split is what the fees follow
+        (address t,) = _launch();
+        trader.swap(pool.poolKey(), true, -10 ether);
+        uint256 potBefore = POT.balance;
+        L.harvest();
+        assertApproxEqRel(POT.balance - potBefore, (POT.balance - potBefore + L.imdBucket()) * 9 / 10, 1e14, "90 / 10");
+        t;
+    }
+
     function test_OnlyTheTimelockRepointsImdsPool() public {
         vm.prank(OWNER);
         vm.expectRevert(IMD6900RobinhoodLaunch.NotTimelock.selector);

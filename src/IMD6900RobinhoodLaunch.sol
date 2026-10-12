@@ -32,7 +32,7 @@ import {IMD6900LockedPool} from "./IMD6900LockedPool.sol";
 ///         Robinhood distributors, so claiming opens once the Robinhood timelock makes this contract one.
 ///         Fees: the pool's 1% accrues to its locked position. {harvest} (anyone) collects it (the IMD6900 part is
 ///         burned by the pool) and splits the ETH: 70% to the pot bridge (Ethereum's NFT pot), 10% to $IMD's burn,
-///         20% ops, until the owner sets other payees. The $IMD share is kept here and {burnImd} (anyone) spends it,
+///         20% ops, until the Robinhood timelock sets other payees ({setPayees}, behind its delay). The $IMD share is kept here and {burnImd} (anyone) spends it,
 ///         at most {IMD_BUY_MAX} a call, buying $IMD on its Robinhood pool for IMD's official burn executor there,
 ///         which bridges it to Base to be destroyed. After the launch, ETH leaves only through the split, the $IMD
 ///         buys, or the timelock's {recoverEth}.
@@ -95,7 +95,7 @@ contract IMD6900RobinhoodLaunch is Ownable, ReentrancyGuard {
     int24 public imdPoolTickSpacing = 100;
     address public imdPoolHooks;
 
-    /// @dev The owner's payees once set (fixed-size); until then 70% the pot bridge, 10% $IMD's burn, 20% the owner
+    /// @dev The timelock's payees once set (fixed-size); until then 70% the pot bridge, 10% $IMD's burn, 20% the owner
     address[8] internal _payees;
     uint16[8] internal _shares;
     uint8 internal _payeeCount;
@@ -278,8 +278,12 @@ contract IMD6900RobinhoodLaunch is Ownable, ReentrancyGuard {
         emit ImdstrReleased(to, amount);
     }
 
-    /// @notice Who the ETH fees are split to: up to {MAX_PAYEES}, shares in basis points summing to 10,000
-    function setPayees(address[] calldata to, uint16[] calldata bps) external onlyOwner {
+    /*                        THE ROBINHOOD TIMELOCK                        */
+
+    /// @notice Who the ETH fees are split to: up to {MAX_PAYEES}, shares in basis points summing to 10,000. IMD's burn
+    ///         executor as a payee means its share buys $IMD for it. Only the Robinhood timelock, behind its delay.
+    function setPayees(address[] calldata to, uint16[] calldata bps) external {
+        if (msg.sender != timelock) revert NotTimelock();
         uint256 n = to.length;
         if (n == 0 || n > MAX_PAYEES || n != bps.length) revert BadPayees();
         uint256 sum;
@@ -292,8 +296,6 @@ contract IMD6900RobinhoodLaunch is Ownable, ReentrancyGuard {
         _payeeCount = uint8(n);
         emit PayeesSet(to, bps);
     }
-
-    /*                        THE ROBINHOOD TIMELOCK                        */
 
     /// @notice Sends ETH held here to `to` (all of it with 0), at any time, behind the timelock's delay: the escape
     ///         hatch for the fees (a payee that refused its share, a split to stop)

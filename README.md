@@ -26,14 +26,15 @@ and the old IMDSTR claims the new coin 1:1, up to each holder's snapshot balance
 The opening price comes from `script/params.py`: chosen so that after the buy the coin trades at IMD6900's Ethereum
 price (2.81 ETH: open at ~19.2 ETH market cap, land at ~25.2, ~126.7M bought). The pool's 1% fee then splits 70% to the
 pot bridge (Ethereum's NFT pot), 10% to $IMD's burn (bought on $IMD's Robinhood pool, sent to IMD's official burn
-executor `0x4D65…1e07`, which bridges it to Base), 20% ops; the IMD6900 part is burned.
+executor `0x4D6537ec564aFf82eABb1Ce5f355E817cBEA1e07`, fixed in the code, which bridges it to Base), 20% ops; the
+IMD6900 part is burned. The split is the Robinhood timelock's to change (`setPayees`, 12h public delay).
 
 ## Red flags, and why there are none
 
 Plain coin (nothing anyone can change), the liquidity locked by construction (no remove path exists), the hook not
 upgradeable and owned by the 12h timelock, the opening buy in the same transaction as the pool (no snipe window), the
 bought coins in a contract (the claims' reserve) or burned, never in a wallet. Owner powers left on the launch: the
-claim list before the launch, the payees, releasing the unclaimed reserve after the claim deadline (≥ 90 days), the
+claim list before the launch, releasing the unclaimed reserve after the claim deadline (≥ 90 days), the
 IMDSTR the claims collected. The hook's owner (the timelock) wires the perps engine: an engine is called before every
 swap, so it goes in only behind the delay.
 
