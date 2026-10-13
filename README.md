@@ -31,7 +31,9 @@ the price from there (today: open at ~19.5 ETH market cap, buy ~2.77 of the 2.81
 (the locked position is the pool's only liquidity). Its ETH splits 90% to the pot bridge (it feeds IMD6900's NFT floor
 pot on Ethereum) and 10% to $IMD's canonical burn (bought on $IMD's Robinhood pool, sent to IMD's official burn
 executor `0x4D6537ec564aFf82eABb1Ce5f355E817cBEA1e07`, fixed in the code, which bridges it to Base); nothing to the
-team. The fee paid in IMD6900 (on sells) is burned: the pot bridge carries ETH only. The perps engine's fees (its open fee
+team. A payee that refuses its share (the bridge paused, say) keeps it as `owed`: it is out of every later split, paid
+by the next split that lists the payee or by `payOwed(payee)` (anyone), and the timelock's `recoverEth` can take it.
+The fee paid in IMD6900 (on sells) is burned: the pot bridge carries ETH only. The perps engine's fees (its open fee
 and liquidation penalties, after its stakers' 20% and insurance's 10%, both editable in the engine) come in through
 `addPerpFees()` and go on, all of it, as ETH to the pot bridge. Every landing address is the timelock's to change: the
 split's payees and shares (`setPayees`), the perps fees' (`setPerpFeeTo`), IMD's burn executor (`setImdBurn`, the
@@ -75,13 +77,14 @@ upgradeable and owned by the 12h timelock, the opening buy in the same transacti
 bought coins in a contract (the claims' reserve) or burned, never in a wallet. Owner powers left on the launch: the
 claim list before the launch, releasing the unclaimed reserve after the claim deadline (≥ 90 days), the
 IMDSTR the claims collected. The timelock (12h, public) wires the perps engine (an engine is called before every swap,
-so it goes in only behind the delay), lowers the fee, sets the split, and can sell the coins the launch holds back for
+so it goes in only behind the delay; the hook refuses one that has no code or can't answer `openCount()`, so a mistaken
+address can't halt trading), lowers the fee, sets the split, and can sell the coins the launch holds back for
 the opening buy's ETH or end the claims early: each visible 12h before it runs.
 
 ## Tests
 
 ```sh
-forge test                                         # 39 tests, offline: admission, the 0x6900 coin, launch, pool, fees, the fee's move, $IMD burn, perps fees, claims, the ETH back
+forge test                                         # 44 tests, offline: admission, the 0x6900 coin, launch, pool, fees, the fee's move, $IMD burn, perps fees, claims, the ETH back
 ROBINHOOD_RPC_URL=https://rpc.mainnet.chain.robinhood.com forge test --match-contract RobinhoodFork -vv
 ```
 

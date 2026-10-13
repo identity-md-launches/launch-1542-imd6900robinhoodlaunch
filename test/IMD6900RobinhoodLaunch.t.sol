@@ -72,6 +72,16 @@ contract Engine is Trader {
     function openCount() external pure returns (uint256) { return 0; }
 }
 
+/// A perps engine that can't run at all: every call reverts
+contract BadEngine {
+    fallback() external payable { revert(); }
+}
+
+/// A payee that refuses ETH (the pot bridge while it is paused or Across reverts)
+contract Refuser {
+    receive() external payable { revert(); }
+}
+
 /// Puts full-range liquidity in a plain pool (the stand-in for $IMD's pool on Robinhood)
 contract LiquidityAdder {
     IPoolManager immutable pm; PoolKey key; uint256 liq;
@@ -712,15 +722,150 @@ contract IMD6900RobinhoodLaunchTest is Test {
     }
 
     function test_OnlyTheTimelockRunsTheHook() public {
+        Engine engine = new Engine(PM); // an engine, not a bare address: setPerpEngine checks it answers (below)
         vm.prank(OWNER);
         vm.expectRevert(Ownable.Unauthorized.selector);
-        hook.setPerpEngine(address(1));
+        hook.setPerpEngine(address(engine));
         vm.prank(TL);
-        hook.setPerpEngine(address(1));
-        assertEq(hook.perpEngine(), address(1));
+        hook.setPerpEngine(address(engine));
+        assertEq(hook.perpEngine(), address(engine));
         vm.prank(TL);
         vm.expectRevert(IMD6900Hook.NoRenounce.selector);
         hook.renounceOwnership();
+    }
+
+    /// Audit 2fa4137a: an engine that can't run its sweep halts every trade in the coin's only pool (the sweep fails
+    /// closed by design). The hook now refuses an engine that has no code or can't even say how many positions it has
+    /// open, so a mistaken address can't freeze the market; zero still turns perps off.
+    function test_TheHookRefusesAnEngineThatCantAnswer() public {
+        _launch();
+        vm.prank(TL);
+        vm.expectRevert(IMD6900Hook.NotAnEngine.selector);
+        hook.setPerpEngine(address(1)); // no code
+        BadEngine bad = new BadEngine();
+        vm.prank(TL);
+        vm.expectRevert(IMD6900Hook.NotAnEngine.selector);
+        hook.setPerpEngine(address(bad)); // code that reverts on everything
+        assertEq(hook.perpEngine(), address(0));
+        trader.swap(pool.poolKey(), true, -1 ether); // trading never stopped
+        Engine engine = new Engine(PM);
+        vm.prank(TL);
+        hook.setPerpEngine(address(engine));
+        trader.swap(pool.poolKey(), true, -1 ether);
+        vm.prank(TL);
+        hook.setPerpEngine(address(0)); // perps off
+        assertEq(hook.perpEngine(), address(0));
+        trader.swap(pool.poolKey(), true, -1 ether);
+    }
+
+    /// Audit 5bb80824: a payee's refused share must stay that payee's (owed), not be re-split: before, each split
+    /// moved 10% of the pot's refused 90% into the $IMD bucket, and sixty of them moved nearly all of it
+    function test_ARefusedShareIsKeptForItsPayee() public {
+        _launch();
+        vm.etch(POT, address(new Refuser()).code); // the pot bridge refuses ETH for a while
+        vm.deal(address(this), 1 ether);
+        (bool ok,) = address(L).call{value: 1 ether}("");
+        require(ok);
+        for (uint256 i; i < 60; ++i) L.split();
+        assertEq(L.imdBucket(), 0.1 ether, "the $IMD share is 10% of the fees, not the pot's refused 90%");
+        assertEq(L.owed(POT), 0.9 ether, "the pot's share, kept for it");
+        assertEq(L.owedTotal(), 0.9 ether);
+        assertEq(address(L).balance, 1 ether);
+        // it takes ETH again: the next split pays what it is owed along with its new share
+        vm.etch(POT, "");
+        vm.deal(address(this), 1 ether);
+        (ok,) = address(L).call{value: 1 ether}("");
+        require(ok);
+        L.split();
+        assertEq(POT.balance, 1.8 ether, "0.9 owed and 0.9 of the new ETH");
+        assertEq(L.owed(POT), 0);
+        assertEq(L.owedTotal(), 0);
+        assertEq(L.imdBucket(), 0.2 ether);
+    }
+
+    function test_ARefusedShareIsPaidOnRetry() public {
+        _launch();
+        vm.etch(POT, address(new Refuser()).code);
+        vm.deal(address(this), 1 ether);
+        (bool ok,) = address(L).call{value: 1 ether}("");
+        require(ok);
+        L.split();
+        assertEq(L.owed(POT), 0.9 ether);
+        vm.expectRevert(); // still refusing: nothing moves
+        L.payOwed(POT);
+        vm.expectRevert(IMD6900RobinhoodLaunch.NoEth.selector);
+        L.payOwed(R); // owed nothing
+        // the timelock repoints the split to R: the pot's owed share is still the pot's, not R's
+        address[] memory to = new address[](1);
+        uint16[] memory bps = new uint16[](1);
+        (to[0], bps[0]) = (R, 10_000);
+        vm.prank(TL);
+        L.setPayees(to, bps);
+        L.split();
+        assertEq(R.balance, 0, "nothing new to split: the owed share and the $IMD bucket are spoken for");
+        vm.etch(POT, "");
+        assertEq(L.payOwed(POT), 0.9 ether);
+        assertEq(POT.balance, 0.9 ether);
+        assertEq(L.owedTotal(), 0);
+        assertEq(address(L).balance, L.imdBucket());
+    }
+
+    function test_TheTimelockCanRecoverARefusedShare() public {
+        _launch();
+        vm.etch(POT, address(new Refuser()).code);
+        vm.deal(address(this), 1 ether);
+        (bool ok,) = address(L).call{value: 1 ether}("");
+        require(ok);
+        L.split();
+        vm.prank(TL);
+        L.recoverEth(TL, 0.95 ether); // the escape hatch: the refused share, and half the $IMD bucket
+        assertEq(L.imdBucket(), 0.05 ether, "what is left is the $IMD bucket's first");
+        assertEq(L.owedTotal(), 0, "the owed share is what was recovered");
+        vm.etch(POT, "");
+        vm.expectRevert(IMD6900RobinhoodLaunch.NoEth.selector);
+        L.payOwed(POT); // recovered: nothing left to retry
+        L.split(); // and nothing to split
+        assertEq(address(L).balance, 0.05 ether);
+        // new fees split as ever, the recovered share forgotten
+        vm.deal(address(this), 1 ether);
+        (ok,) = address(L).call{value: 1 ether}("");
+        require(ok);
+        L.split();
+        assertEq(POT.balance, 0.9 ether);
+        assertEq(L.owed(POT), 0);
+        assertEq(L.owedTotal(), 0);
+        assertEq(L.imdBucket(), 0.15 ether);
+    }
+
+    /// Audit 90b69d78: claims never pass the reserve, whatever the leaves sum to: the coins beyond it are the
+    /// timelock's (excessHeld), and endClaims / releaseUnclaimed / claimReserve must keep working
+    function test_ClaimsNeverPassTheReserve() public {
+        vm.prank(OWNER);
+        L.setClaims(_root(), AA + BB, block.timestamp + 100 days); // leaves sum to AA + BB + CC
+        vm.deal(OWNER, BUY);
+        address expected_ = L.tokenAddress(SALT);
+        vm.prank(OWNER);
+        (address t,) = L.launch{value: BUY}(SALT, expected_, _sqrtPrice(OPEN_MC), 0, address(L));
+        uint256 held = L.excessHeld();
+        vm.startPrank(A);
+        imdstr.approve(address(L), AA);
+        L.claim(AA, AA, _proof(0));
+        vm.stopPrank();
+        vm.startPrank(B);
+        imdstr.approve(address(L), BB);
+        L.claim(BB, BB, _proof(1));
+        vm.stopPrank();
+        assertEq(L.claimReserve(), 0);
+        vm.startPrank(C);
+        imdstr.approve(address(L), CC);
+        bytes32[] memory pc = _proof(2);
+        vm.expectRevert(IMD6900RobinhoodLaunch.OverClaim.selector);
+        L.claim(1, CC, pc);
+        vm.stopPrank();
+        assertEq(IERC20(t).balanceOf(address(L)), held, "the timelock's coins untouched");
+        vm.prank(TL);
+        L.endClaims();
+        assertEq(L.excessHeld(), held);
     }
 
     function test_TheCoinIsPlain() public {

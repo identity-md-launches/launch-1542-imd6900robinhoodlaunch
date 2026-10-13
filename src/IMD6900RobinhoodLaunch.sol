@@ -99,6 +99,10 @@ contract IMD6900RobinhoodLaunch is Ownable, ReentrancyGuard {
     /// @notice ETH set aside for $IMD's burn, spent by {burnImd}; and what it has bought and sent so far
     uint256 public imdBucket;
     uint256 public imdBurned;
+    /// @notice What a payee refused (its receive reverted): kept here for it, out of the next {split}, paid by the
+    ///         next split that lists it or by {payOwed}; and the sum of it
+    mapping(address => uint256) public owed;
+    uint256 public owedTotal;
     /// @notice $IMD's Robinhood pool: ETH / $IMD at this fee, tick spacing and hooks (the timelock may repoint it)
     uint24 public imdPoolFee = 10_000;
     int24 public imdPoolTickSpacing = 100;
@@ -126,6 +130,7 @@ contract IMD6900RobinhoodLaunch is Ownable, ReentrancyGuard {
     event FeesReceived(address indexed from, uint256 amount);
     event Split(uint256 amount);
     event PayFailed(address payee, uint256 amount);
+    event OwedPaid(address payee, uint256 amount);
     event PayeesSet(address[] payees, uint16[] shares);
     event EthRecovered(address to, uint256 amount);
     event ExcessReleased(address to, uint256 amount);
@@ -349,7 +354,9 @@ contract IMD6900RobinhoodLaunch is Ownable, ReentrancyGuard {
         if (amount == 0) amount = address(this).balance;
         if (amount == 0) revert NoEth();
         SafeTransferLib.safeTransferETH(to, amount);
-        if (imdBucket > address(this).balance) imdBucket = address(this).balance;
+        uint256 left = address(this).balance;
+        if (imdBucket > left) imdBucket = left;
+        if (owedTotal > left - imdBucket) owedTotal = left - imdBucket; // what it took of a refused share is recovered
         emit EthRecovered(to, amount);
     }
 
@@ -429,32 +436,49 @@ contract IMD6900RobinhoodLaunch is Ownable, ReentrancyGuard {
         if (!_verify(proof, claimRoot, leaf)) revert BadProof();
         uint256 done = claimedBy[msg.sender] + amount;
         if (done > allowance) revert OverClaim();
+        uint256 total = claimedTotal + amount;
+        if (total > claimTotal) revert OverClaim(); // never past the reserve: the held coins are the timelock's
         claimedBy[msg.sender] = done;
-        claimedTotal += amount;
+        claimedTotal = total;
         SafeTransferLib.safeTransferFrom(imdstr, msg.sender, address(this), amount);
         SafeTransferLib.safeTransfer(token, msg.sender, amount);
         emit Claimed(msg.sender, amount);
     }
 
-    /// @notice Pays the ETH here (beyond what is set aside for $IMD) to the payees, pro rata; the burn executor's share
-    ///         is set aside for {burnImd} instead. After the launch only. A payee that refuses its share leaves it here
-    ///         for the next split.
+    /// @notice Pays the ETH here (beyond what is set aside for $IMD, and what a payee is owed) to the payees, pro rata;
+    ///         the burn executor's share is set aside for {burnImd} instead. After the launch only. A payee that
+    ///         refuses its share keeps it as {owed}, out of every later split, until it takes it: the next split that
+    ///         lists it retries, {payOwed} retries for one no longer listed.
     function split() public nonReentrant returns (uint256 amount) {
         if (token == address(0)) revert NotLaunched();
-        amount = address(this).balance - imdBucket;
+        amount = address(this).balance - imdBucket - owedTotal;
         if (amount == 0) return 0;
         (address[] memory to, uint16[] memory bps) = payees();
         for (uint256 i; i < to.length; ++i) {
             uint256 part = (amount * bps[i]) / 10_000;
-            if (part == 0) continue;
             if (to[i] == imdBurn) {
                 imdBucket += part;
                 continue;
             }
-            (bool ok,) = to[i].call{value: part}("");
-            if (!ok) emit PayFailed(to[i], part);
+            uint256 due = owed[to[i]];
+            if (due != 0) {
+                if (due > owedTotal) due = owedTotal; // the timelock may have recovered part of it
+                (owed[to[i]], owedTotal) = (0, owedTotal - due);
+                part += due;
+            }
+            if (part != 0) _pay(to[i], part);
         }
         emit Split(amount);
+    }
+
+    /// @notice Retries what `payee` refused earlier ({owed}): all of it, or nothing. Anyone.
+    function payOwed(address payee) external nonReentrant returns (uint256 amount) {
+        amount = owed[payee];
+        if (amount > owedTotal) amount = owedTotal; // the timelock may have recovered part of it
+        if (amount == 0) revert NoEth();
+        (owed[payee], owedTotal) = (0, owedTotal - amount);
+        SafeTransferLib.safeTransferETH(payee, amount);
+        emit OwedPaid(payee, amount);
     }
 
     /// @notice Buys $IMD with what is set aside for its burn, at most {IMD_BUY_MAX} a call, and sends it to IMD's burn
@@ -509,6 +533,16 @@ contract IMD6900RobinhoodLaunch is Ownable, ReentrancyGuard {
     }
 
     /*                              INTERNAL                                */
+
+    /// @dev A payee's share: what it refuses is kept for it ({owed}), not re-split
+    function _pay(address payee, uint256 part) internal {
+        (bool ok,) = payee.call{value: part}("");
+        if (!ok) {
+            owed[payee] += part;
+            owedTotal += part;
+            emit PayFailed(payee, part);
+        }
+    }
 
     function _hookInitCode() internal view returns (bytes memory) {
         return abi.encodePacked(type(IMD6900Hook).creationCode, abi.encode(poolManager, address(pool), timelock));

@@ -68,6 +68,8 @@ contract IMD6900Hook is BaseHook, Ownable {
     /// @notice The perps engine could not run its sweep at all
     error SweepUnavailable();
     error NoRenounce();
+    /// @notice The engine set has no code, or can't say how many positions it has open: it would halt every trade
+    error NotAnEngine();
 
     /// @param owner_ the Robinhood timelock: the engine and the escape hatch wait out its delay
     constructor(IPoolManager poolManager_, address pool_, address owner_) BaseHook(poolManager_) {
@@ -103,8 +105,15 @@ contract IMD6900Hook is BaseHook, Ownable {
     /*                       OWNER (the Robinhood timelock)                  */
 
     /// @dev Replaceable: an engine whose sweep can never run blocks trading (fail closed), so the owner keeps the way
-    ///      out, behind the timelock. Zero turns perps off.
+    ///      out, behind the timelock. Zero turns perps off. Anything else must be a contract that answers
+    ///      {IPerpSweep.openCount}: a mistaken address (no code, or not an engine) would otherwise halt every trade
+    ///      in the pool until the timelock's next delay runs out.
     function setPerpEngine(address engine) external onlyOwner {
+        if (engine != address(0)) {
+            if (engine.code.length == 0) revert NotAnEngine();
+            (bool ok, bytes memory ret) = engine.staticcall(abi.encodeCall(IPerpSweep.openCount, ()));
+            if (!ok || ret.length < 32) revert NotAnEngine();
+        }
         perpEngine = engine;
         emit PerpEngineSet(engine);
     }
