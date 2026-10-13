@@ -68,6 +68,7 @@ contract IMD6900Hook is BaseHook, Ownable {
     /// @notice The perps engine could not run its sweep at all
     error SweepUnavailable();
     error NoRenounce();
+    error NoEth();
     /// @notice The engine set has no code, or can't say how many positions it has open: it would halt every trade
     error NotAnEngine();
 
@@ -128,6 +129,27 @@ contract IMD6900Hook is BaseHook, Ownable {
         revert NoRenounce();
     }
 
+    /// @dev Nothing here can move ETH out, so none comes in: solady's Ownable entry points are payable by default
+    function transferOwnership(address newOwner) public payable override {
+        if (msg.value != 0) revert NoEth();
+        super.transferOwnership(newOwner);
+    }
+
+    function requestOwnershipHandover() public payable override {
+        if (msg.value != 0) revert NoEth();
+        super.requestOwnershipHandover();
+    }
+
+    function cancelOwnershipHandover() public payable override {
+        if (msg.value != 0) revert NoEth();
+        super.cancelOwnershipHandover();
+    }
+
+    function completeOwnershipHandover(address pendingOwner) public payable override {
+        if (msg.value != 0) revert NoEth();
+        super.completeOwnershipHandover(pendingOwner);
+    }
+
     /*                              CALLBACKS                               */
 
     /// @dev Only the locked pool, only ETH / its coin at the locked pool's current static fee, tick spacing 60, this
@@ -144,12 +166,12 @@ contract IMD6900Hook is BaseHook, Ownable {
         return BaseHook.beforeInitialize.selector;
     }
 
-    function _beforeAddLiquidity(address sender, PoolKey calldata, ModifyLiquidityParams calldata params, bytes calldata)
-        internal
-        view
-        override
-        returns (bytes4)
-    {
+    function _beforeAddLiquidity(
+        address sender,
+        PoolKey calldata,
+        ModifyLiquidityParams calldata params,
+        bytes calldata
+    ) internal view override returns (bytes4) {
         _checkLiquidity(sender, params);
         return BaseHook.beforeAddLiquidity.selector;
     }
@@ -205,8 +227,9 @@ contract IMD6900Hook is BaseHook, Ownable {
         uint256 reserve = spec != 0 ? SWEEP_GAS_RESERVE + SWEEP_GAS_MIN : SWEEP_GAS_RESERVE;
         uint256 g = gasleft();
         if (g > reserve + SWEEP_GAS_MIN) {
-            (bool ok, bytes memory out) =
-                engine.call{gas: g - reserve}(abi.encodeCall(IPerpSweep.sweepLiquidations, (tx.origin, spec, isBuy, limit)));
+            (bool ok, bytes memory out) = engine.call{gas: g - reserve}(
+                abi.encodeCall(IPerpSweep.sweepLiquidations, (tx.origin, spec, isBuy, limit))
+            );
             if (spec == 0) return;
             if (!ok || out.length < 32) {
                 if (!sweepFailOpen) revert SweepUnavailable();

@@ -35,12 +35,15 @@ team. A payee that refuses its share (the bridge paused, say) keeps it as `owed`
 by the next split that lists the payee or by `payOwed(payee)` (anyone), and the timelock's `recoverEth` can take it.
 The fee paid in IMD6900 (on sells) is burned: the pot bridge carries ETH only. The perps engine's fees (its open fee
 and liquidation penalties, after its stakers' 20% and insurance's 10%, both editable in the engine) come in through
-`addPerpFees()` and go on, all of it, as ETH to the pot bridge. Every landing address is the timelock's to change: the
+`addPerpFees()` and go on, all of it, as ETH to the pot bridge (what it refuses is kept for it as `owed`, like a
+payee's share, so the engine's flush never fails). Every landing address is the timelock's to change: the
 split's payees and shares (`setPayees`), the perps fees' (`setPerpFeeTo`), IMD's burn executor (`setImdBurn`, the
 canonical one by default), $IMD's pool (`setImdPool`).
 
 The road to the pot, end to end (each step anyone's to call; `script/launch.sh pot` does them all): `harvest()` here,
-`burnImd(min)` for the $IMD share, the pot bridge's `bridge()` (Robinhood → Across → Ethereum, from 0.05 ETH), then on
+`burnImd(min)` for the $IMD share (at most 0.1 ETH a buy and one buy a minute, so no transaction can sandwich more than
+one; the bucket is charged what $IMD's pool took, and a buy that gets nothing reverts), the pot bridge's `bridge()`
+(Robinhood → Across → Ethereum, from 0.05 ETH), then on
 Ethereum the pot hook's `depositBridgedFees()` (`0xA160…6444`), which adds it to the NFT pot: the strategy buys
 identity.md NFTs at the floor with it, and what it resells them for buys IMD6900 on Ethereum. Rehearsed on forks of
 both chains: 0.1 ETH bridged over Across, then 0.0995 into the pot. The split is the Robinhood timelock's to change (`setPayees`, 12h public delay).
@@ -84,7 +87,7 @@ the opening buy's ETH or end the claims early: each visible 12h before it runs.
 ## Tests
 
 ```sh
-forge test                                         # 44 tests, offline: admission, the 0x6900 coin, launch, pool, fees, the fee's move, $IMD burn, perps fees, claims, the ETH back
+forge test                                         # 49 tests, offline: admission, the 0x6900 coin, launch, pool, fees, the fee's move, $IMD burn, perps fees, claims, the ETH back
 ROBINHOOD_RPC_URL=https://rpc.mainnet.chain.robinhood.com forge test --match-contract RobinhoodFork -vv
 ```
 

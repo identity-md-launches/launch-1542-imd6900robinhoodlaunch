@@ -237,7 +237,10 @@ contract IMD6900LockedPool is ReentrancyGuard {
         return l > type(uint128).max ? type(uint128).max : uint128(l);
     }
 
-    function _payOut(uint256 eth, uint256 tokens) internal {
+    /// @dev Forwards the ETH held here: what the pool just paid, and anything sent here by mistake (nothing stays here
+    ///      between unlocks, so the balance is all of it)
+    function _payOut(uint256, uint256 tokens) internal {
+        uint256 eth = address(this).balance;
         if (eth != 0) IFeeSink(launcher).addFees{value: eth}();
         if (tokens != 0) IBurnable(token).burn(tokens);
         emit Collected(eth, tokens);

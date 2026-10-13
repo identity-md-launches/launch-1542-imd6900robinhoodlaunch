@@ -13,7 +13,8 @@ The project already fits the launch kind as it arrived, so no change was made fo
   no initializer, no proxy. The owner is the first argument, never `msg.sender`. It calls nothing that existed before it:
   it only creates `IMD6900LockedPool` with `new`, which also calls nothing. Rehearsed offline against the protected
   floor's probe (CREATE2 from an etched factory, `vm.chainId(4663)`, the four arguments above): the constructor runs on
-  an empty chain, ~7.1M gas through the probe, init code 32,829 bytes (< 49,152), runtime 22,592 bytes (< 24,576),
+  an empty chain, ~7.1M gas through the probe, init code 33,254 bytes (< 49,152), runtime 22,708 bytes (< 24,576) after
+this revision (rehearsed again with the probe, chain id 4663, the four arguments above),
   no CALLCODE / DELEGATECALL / SELFDESTRUCT in the runtime. `test_DeploysOnAFreshChain`, `test_FitsOneTransaction`
   and `test_PassesTheAdmissionScan` cover the same in the suite.
 - **Libraries.** Every library function called (solady, v4-core's `Hooks`, `TickMath`, `FullMath`, `StateLibrary`,
@@ -94,15 +95,91 @@ changed source and passed (the whole launch on live state: claims, Universal Rou
 bridge, the $IMD buy for the burn executor, the move to 3.33%, the held coins sold back). It still skips without
 `ROBINHOOD_RPC_URL`, so the offline suite needs no network.
 
+## Revision: the independent review's findings
+
+Each was reproduced on the accepted tree before anything changed (the supplied proof for the second; local tests under
+`test/scratch/` for the rest, since replaced by the suite's tests named below). The answers are in `.imd-responses.json`.
+
+### 6. `burnImd`'s 0.1 ETH cap held per call, not per transaction (medium, f5033c14…) — reproduced, fixed
+
+Reproduced as reported: with 3 ETH in the bucket and the $IMD pool 62 ETH deep, one transaction bought 40 ETH of $IMD,
+called `burnImd(0)` thirty times and sold back, ending 1.2268 ETH up; the burn executor got 280 $IMD against 740 for
+the same bucket spent honestly.
+
+`src/IMD6900RobinhoodLaunch.sol`: one buy every `IMD_BUY_GAP` (1 minute; `lastImdBuy`, `TooSoon`). `block.timestamp`
+is constant within a transaction and a block, so a sandwich can wrap one buy of at most 0.1 ETH, which the pool's two 1%
+fees make a loss (the same sandwich now ends 0.58 ETH down). A minute rather than a block because Robinhood Chain is
+Arbitrum-based, where `block.number` is the L1's and sub-second blocks share a timestamp: a spacing in seconds is the
+same on any chain and makes a cross-block repeat hold its position in the open for the whole run. The bucket still
+drains at up to 144 ETH a day, far above what the 10% share can accrue. `script/launch.sh pot` calls it once a run,
+unchanged.
+
+Test: `test_TheImdBurnCantBeSandwiched` (the reviewer's attack: one call succeeds, the searcher loses; a second call in
+the same block reverts `TooSoon`; a minute later the next buy runs).
+
+### 7. `burnImd` debited the bucket by the requested spend, not what the pool took (medium, 60984bf7…) — reproduced, fixed
+
+Reproduced with the supplied proof (`Proof_60984bf755ca`): on an $IMD pool with no liquidity, `burnImd(0)` returned 0,
+the bucket fell 0.1 ETH, and the next `split()` sent 0.09 ETH of the $IMD share to the pot bridge.
+
+`src/IMD6900RobinhoodLaunch.sol`: the unlock callback's buys (the opening buy and the $IMD buy) return `(out, ethIn)`;
+`burnImd` debits `imdBucket` by `ethIn`, what the pool actually took, and reverts `Short(0)` when the buy returns
+nothing. `ImdBurned` reports `ethIn`. The proof passes.
+
+Test: `test_TheBucketIsChargedWhatTheBuyTook` (a dry pool: revert, bucket unchanged, nothing to the pot; a thin range
+just under the price: the buy runs through it, the bucket pays only that, the rest stays the bucket's).
+
+### 8. `addPerpFees` reverted when `perpFeeTo` refused ETH (low, b9ea53dd…) — reproduced, fixed
+
+Reproduced: with `perpFeeTo` a contract whose `receive` reverts, `addPerpFees{value: 1 ether}()` reverted
+`ETHTransferFailed`, while `split()` keeps a refused share as owed.
+
+`src/IMD6900RobinhoodLaunch.sol`: `addPerpFees` pays through `_pay`, so a refused flush is kept as `owed[perpFeeTo]`
+(paid by the next split that lists it, by `payOwed`, or recovered by the timelock), and the perps engine's flush never
+fails on its sink. Still all of it, as ETH, to the pot bridge by default. Test: `test_PerpFeesRefusedAreOwed`.
+
+### 9. The launch inherited `renounceOwnership` (low, c5af05c5…) — reproduced, fixed
+
+Reproduced: the owner could set `owner()` to zero, after which `setClaims`, `launch`, `releaseUnclaimed` and
+`releaseImdstr` were unreachable. `src/IMD6900RobinhoodLaunch.sol`: `renounceOwnership` reverts `NoRenounce`, as the
+hook's does; `transferOwnership` still works. Test: `test_TheLaunchOwnerCantRenounce`.
+
+### 10. ETH sent to the locked pool, or with the hook's payable Ownable calls, was stuck (low, c226c7cd…) — reproduced, fixed
+
+Reproduced: 1 ETH sent to the pool stayed there through `collect()` and `lowerFee`; `hook.transferOwnership{value: 1 ether}`
+succeeded and nothing could move it. `src/IMD6900LockedPool.sol`: `_payOut` forwards the pool's whole ETH balance (it
+holds none between unlocks, so that is what the pool just paid plus anything sent by mistake) to the launch's fee split.
+`src/IMD6900Hook.sol`: `transferOwnership`, `requestOwnershipHandover`, `cancelOwnershipHandover` and
+`completeOwnershipHandover` revert `NoEth` on any value. Changing the hook changes `hookInitCodeHash`, which is what the
+off-chain salt is mined against after the source is bound, so nothing else follows. Test: `test_EthSentToThePoolIsForwarded`.
+
+### 11. `sellHeld`'s floor is fixed when the timelock queues it (low, 494cd668…) — reproduced, not changed
+
+Reproduced as described: a searcher with a 1 ETH position sells before the queued `sellHeld(0, 0, R)` and buys back
+after, taking about 0.03 ETH of the 0.108 ETH less that `R` receives. The brief binds `sellHeld` as the timelock's,
+with `minEth` as its floor; an execution-time quote or a TWAP (v4 has none built in) would be a redesign of the
+timelock's role. The timelock holds the mitigation already: it sets `amount` and `minEth`, so it sells in tranches
+sized so the sale's own impact stays under the pool's 8.9% round-trip fee (the test launch's held coins against the
+pool's ETH side are far above that in one go), and a `minEth` near the price at execution rather than 0. Left as a
+documented trust assumption of the timelock's operation.
+
+### 12. `endClaims` has no time gate (info, a6f5f764…) — reproduced, not changed
+
+Reproduced: the timelock can end the claims the block after the launch. The brief lists "ends the claims early" as the
+timelock's role and the function relies on the timelock's public delay for notice; `MIN_CLAIM_WINDOW` binds the owner's
+release only. Recorded as the trust assumption the reviewer named, not changed.
+
 ## Files changed
 
 | File | Change |
 |---|---|
-| `src/IMD6900RobinhoodLaunch.sol` | `owed` / `owedTotal`, `_pay`, `payOwed`, `OwedPaid`; `split()` over the free balance only; `recoverEth` clamps `owedTotal`; `claim()` bounded by `claimTotal` |
-| `src/IMD6900Hook.sol` | `setPerpEngine` refuses a non-engine (`NotAnEngine`) |
-| `test/IMD6900RobinhoodLaunch.t.sol` | the five tests above, the `BadEngine` and `Refuser` stand-ins, `test_OnlyTheTimelockRunsTheHook` adjusted |
-| `README.md` | the test count, the owed share and the engine check |
+| `src/IMD6900RobinhoodLaunch.sol` | `owed` / `owedTotal`, `_pay`, `payOwed`, `OwedPaid`; `split()` over the free balance only; `recoverEth` clamps `owedTotal`; `claim()` bounded by `claimTotal`; `burnImd` one buy a minute (`IMD_BUY_GAP`, `lastImdBuy`, `TooSoon`), debited by what the pool took, reverting on an empty buy; the buy callbacks return `(out, ethIn)`; `addPerpFees` through `_pay`; `renounceOwnership` reverts |
+| `src/IMD6900Hook.sol` | `setPerpEngine` refuses a non-engine (`NotAnEngine`); the Ownable entry points refuse ETH (`NoEth`) |
+| `src/IMD6900LockedPool.sol` | `_payOut` forwards the pool's whole ETH balance |
+| `test/IMD6900RobinhoodLaunch.t.sol` | the ten tests above, the `BadEngine`, `Refuser`, `RangeAdder` and `Searcher` stand-ins, `_imdPool` shared, `test_OnlyTheTimelockRunsTheHook` adjusted |
+| `README.md` | the test count, the owed share, the engine check, the burn's gap and charge |
 | `ADAPTATION.md` | this file |
 
-`forge build` and `forge test` pass offline: 44 tests in `IMD6900RobinhoodLaunchTest`, the fork test skipped without
-an RPC. Tests use no environment and pass in any order.
+`forge build` and `forge test` pass offline: 49 tests in `IMD6900RobinhoodLaunchTest`, the fork test skipped without
+an RPC. The fork test was run again against `https://rpc.mainnet.chain.robinhood.com` with this revision's source and
+passed. Tests use no environment and pass in any order.
