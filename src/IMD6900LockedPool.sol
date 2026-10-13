@@ -28,7 +28,7 @@ interface IBurnable {
 ///         here. There is no owner and no function that takes liquidity out to anyone: what is in the pool stays in a
 ///         pool. Two things happen to it:
 ///          - {collect} (anyone): the fee the position earns comes out, its ETH to the launch's fee split (the NFT
-///            pot, $IMD's burn, ops), its IMD6900 burned;
+///            pot and $IMD's burn), its IMD6900 burned;
 ///          - {lowerFee} (the Robinhood timelock, behind its delay): the pool's fee is static (that is what keeps
 ///            Uniswap's routing automatic), so a lower fee is a new pool. This moves the position, in one unlock, from
 ///            the current pool into a fresh one at the lower fee and the same price: the two legs settle against each

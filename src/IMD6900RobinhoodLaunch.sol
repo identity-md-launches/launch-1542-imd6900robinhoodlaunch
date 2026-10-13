@@ -35,8 +35,9 @@ import {IMD6900LockedPool} from "./IMD6900LockedPool.sol";
 ///         Robinhood distributors, so claiming opens once the Robinhood timelock makes this contract one.
 ///         Fees: the pool's static 4.44% (the timelock can move the liquidity to a lower-fee pool, never higher)
 ///         accrues to its locked position. {harvest} (anyone) collects it (the IMD6900 part is
-///         burned by the pool) and splits the ETH: 70% to the pot bridge (Ethereum's NFT pot), 10% to $IMD's burn,
-///         20% ops, until the Robinhood timelock sets other payees ({setPayees}, behind its delay). The $IMD share is kept here and {burnImd} (anyone) spends it,
+///         burned by the pool) and splits the ETH: 90% to the pot bridge (IMD6900's NFT floor pot on Ethereum), 10% to
+///         $IMD's canonical burn, until the Robinhood timelock sets other payees ({setPayees}, behind its delay). The $IMD
+///         share is kept here and {burnImd} (anyone) spends it,
 ///         at most {IMD_BUY_MAX} a call, buying $IMD on its Robinhood pool for IMD's official burn executor there,
 ///         which bridges it to Base to be destroyed. After the launch, ETH leaves only through the split, the $IMD
 ///         buys, or the timelock's {recoverEth}.
@@ -51,7 +52,7 @@ contract IMD6900RobinhoodLaunch is Ownable, ReentrancyGuard {
     uint256 public constant SUPPLY = 1_000_000_000 ether;
     /// @notice PonsPotBridge on Robinhood: bridges ETH (Across) to the Ethereum launch hook, which feeds IMD6900's NFT pot
     address public constant POT_BRIDGE = 0xc39e650a24985C2bBA9FD83C81041B8f3E3f9EDd;
-    uint16 public constant POT_BPS = 7_000;
+    uint16 public constant POT_BPS = 9_000;
     /// @notice $IMD (Identity.md) on Robinhood Chain, and its official burn executor there (it bridges what it holds to
     ///         IMD's burn receiver on Base). As a payee, the executor's share buys $IMD rather than being sent as ETH.
     address public constant IMD = 0x5F7Bb59365ce557C26dbcAa4EE9d39A4b95B7127;
@@ -101,7 +102,7 @@ contract IMD6900RobinhoodLaunch is Ownable, ReentrancyGuard {
     int24 public imdPoolTickSpacing = 100;
     address public imdPoolHooks;
 
-    /// @dev The timelock's payees once set (fixed-size); until then 70% the pot bridge, 10% $IMD's burn, 20% the owner
+    /// @dev The timelock's payees once set (fixed-size); until then 90% the pot bridge, 10% $IMD's burn
     address[8] internal _payees;
     uint16[8] internal _shares;
     uint8 internal _payeeCount;
@@ -205,9 +206,8 @@ contract IMD6900RobinhoodLaunch is Ownable, ReentrancyGuard {
     function payees() public view returns (address[] memory to, uint16[] memory bps) {
         uint256 n = _payeeCount;
         if (n == 0) {
-            (to, bps) = (new address[](3), new uint16[](3));
+            (to, bps) = (new address[](2), new uint16[](2));
             (to[0], bps[0], to[1], bps[1]) = (POT_BRIDGE, POT_BPS, IMD_BURN, IMD_BPS);
-            (to[2], bps[2]) = (owner(), 10_000 - POT_BPS - IMD_BPS);
             return (to, bps);
         }
         (to, bps) = (new address[](n), new uint16[](n));

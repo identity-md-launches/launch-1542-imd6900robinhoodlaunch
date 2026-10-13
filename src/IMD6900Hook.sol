@@ -94,8 +94,9 @@ contract IMD6900Hook is BaseHook, Ownable {
         });
     }
 
-    /// @notice The trading fee in basis points, for the perps engine's model: the pool's own, the same for everyone
-    function feeBps() public view returns (uint256) {
+    /// @notice The fee the perps engine's own swaps pay, in basis points (PerpEngine reads it to price closes and
+    ///         liquidations; without it, it assumes its 10% cap): the pool's static fee, the same for everyone
+    function perpFeeBps() public view returns (uint256) {
         return ILockedPoolView(pool).fee() / 100;
     }
 

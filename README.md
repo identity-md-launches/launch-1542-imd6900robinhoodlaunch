@@ -12,7 +12,7 @@ and the old IMDSTR claims the new coin 1:1, up to each holder's snapshot balance
 | `src/IMD6900RobinhoodLaunch.sol` | What the swarm deploys. Its constructor creates the locked pool and calls nothing that existed before it (~6.2M gas, the same from any deployer). `createHook(salt)` (anyone, once) then creates the hook at a salt mined off-chain for its address. Then the launch, the claims, the fee split. |
 | `src/IMD6900.sol` | The coin: 1B minted once to the launch. No owner, no mint, no tax, no pause, no blacklist, no limits, no proxy. Holders can burn their own. |
 | `src/IMD6900LockedPool.sol` | Owns the pool's one position. No owner, no way to take liquidity out. `collect()` (anyone): ETH fees to the split, IMD6900 fees burned. `lowerFee(fee)` (the timelock only, lower only): moves the position, in one transaction, into a new pool at the lower fee and the same price. |
-| `src/IMD6900Hook.sol` | ETH / IMD6900 only, at the locked pool's static fee, initialized by the locked pool only (at the launch, and at each lower fee it moves to), liquidity from it only. Charges nothing itself: no dynamic fee, no return deltas. In-pool perps sweep once the timelock wires an engine. Not upgradeable. Owned by the Robinhood timelock. |
+| `src/IMD6900Hook.sol` | ETH / IMD6900 only, at the locked pool's static fee, initialized by the locked pool only (at the launch, and at each lower fee it moves to), liquidity from it only. Charges nothing itself: no dynamic fee, no return deltas. In-pool perps: before every swap that isn't the engine's own, the engine (once the timelock wires one) liquidates every position the swap would sink, at the price before it moves; a best-effort second sweep after. Reports the pool's fee to the engine (`perpFeeBps`). Not upgradeable. Owned by the Robinhood timelock. |
 
 ## The launch, one transaction
 
@@ -26,10 +26,11 @@ and the old IMDSTR claims the new coin 1:1, up to each holder's snapshot balance
 The opening price and the buy come from `script/params.py`, so that after the buy the coin trades at exactly IMD6900's
 Ethereum price: the pool opens on a tick (0.6% apart), so it rounds the opening onto one and sizes the buy to land on
 the price from there (today: open at ~19.5 ETH market cap, buy ~2.77 of the 2.81 ETH, 4.44% fee included, land at
-~25.15 = Ethereum's, ~119.5M bought). The pool's fee (4.44% on every trade, the opening buy's too) then splits 70% to the
-pot bridge (Ethereum's NFT pot), 10% to $IMD's burn (bought on $IMD's Robinhood pool, sent to IMD's official burn
-executor `0x4D6537ec564aFf82eABb1Ce5f355E817cBEA1e07`, fixed in the code, which bridges it to Base), 20% ops; the
-IMD6900 part is burned. The split is the Robinhood timelock's to change (`setPayees`, 12h public delay).
+~25.15 = Ethereum's, ~119.5M bought). The pool's fee (4.44% on every trade, the opening buy's too) is all the protocol's
+(the locked position is the pool's only liquidity). Its ETH splits 90% to the pot bridge (it feeds IMD6900's NFT floor
+pot on Ethereum) and 10% to $IMD's canonical burn (bought on $IMD's Robinhood pool, sent to IMD's official burn
+executor `0x4D6537ec564aFf82eABb1Ce5f355E817cBEA1e07`, fixed in the code, which bridges it to Base); nothing to the
+team. The fee paid in IMD6900 (on sells) is burned: the pot bridge carries ETH only. The split is the Robinhood timelock's to change (`setPayees`, 12h public delay).
 
 ## The fee, and routing
 
@@ -47,8 +48,8 @@ sits in the pool against the coins the buy landed, and the launch holds those co
 can sell them back into the pool, ETH to any address (`sellHeld(amount, minEth, to)`), and can end the claims early
 (`endClaims()`: the unclaimed reserve joins what it can sell; holders see it 12h ahead and can claim first; what they
 claimed is theirs). Selling everything right after the launch returns the buy less 4.44% each way, plus the buy's fee
-through the split: on a fork, 2.54 ETH for the 2.77 spent, ~93% of the 2.81 with the split's ops share (~96% with the
-split pointed at the team); the excess alone, claims kept, ~1.3 ETH. Later, it depends on the price the market left.
+through the split: on a fork, 2.54 ETH for the 2.77 spent, ~92% of the 2.81 with what the buy didn't spend (~96% with
+the split pointed at the team for that harvest); the excess alone, claims kept, ~1.3 ETH. Later, it depends on the price the market left.
 `script/launch.sh recover` (`END_CLAIMS=1` for the reserve too) queues it, `recover-exec` runs it.
 
 ## The liquidity: locked, its fees not

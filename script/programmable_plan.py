@@ -193,7 +193,7 @@ def main():
         "publication": {"visibility": "listed", "name": "Identity.MD 6900", "symbol": "IMD6900",
                         "description": "Identity.MD 6900 on Robinhood Chain: the identity.md machine strategy, the meme branch of the IMD swarm. "
                                        "Launched by the IMD swarm: the whole supply in a locked Uniswap v4 pool with in-pool perps to come, "
-                                       "its 4.44% fee (lowerable, never raised): 70% to Ethereum's NFT pot, 10% to $IMD's burn.",
+                                       "its 4.44% fee (lowerable, never raised): 90% to IMD6900's NFT floor pot on Ethereum, 10% to $IMD's canonical burn.",
                         "imageUrl": "https://imd6900.pages.dev/logo.png", "primaryComponentId": "imd6900", "primaryMarketId": "imd6900-eth",
                         "links": ["https://x.com/IMD6900", "https://imd6900.pages.dev"]},
     }

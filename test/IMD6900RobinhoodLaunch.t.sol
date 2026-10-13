@@ -373,14 +373,12 @@ contract IMD6900RobinhoodLaunchTest is Test {
         uint256 ownerBefore = OWNER.balance;
         L.harvest();
         uint256 toPot = POT.balance - potBefore;
-        uint256 toOps = OWNER.balance - ownerBefore;
         emit log_named_decimal_uint("pot bridge", toPot, 18);
-        emit log_named_decimal_uint("ops", toOps, 18);
-        uint256 fees = toPot + toOps + L.imdBucket();
+        uint256 fees = toPot + L.imdBucket();
         assertApproxEqRel(fees, (10 ether + BUY) * 444 / 10_000, 0.001e18, "4.44% of the buys, the opening buy's included");
-        assertApproxEqRel(toPot, fees * 7 / 10, 1e14, "70% the pot");
-        assertApproxEqRel(L.imdBucket(), fees / 10, 1e14, "10% set aside for $IMD's burn");
-        assertApproxEqRel(toOps, fees * 2 / 10, 1e14, "20% ops");
+        assertApproxEqRel(toPot, fees * 9 / 10, 1e14, "90% the NFT floor pot");
+        assertApproxEqRel(L.imdBucket(), fees / 10, 1e14, "10% set aside for $IMD's canonical burn");
+        assertEq(OWNER.balance, ownerBefore, "nothing to the team");
         assertLt(IERC20(t).totalSupply(), supply, "the coin's fees are burned");
         assertEq(address(L).balance, L.imdBucket(), "only the $IMD share stays");
     }
@@ -413,7 +411,7 @@ contract IMD6900RobinhoodLaunchTest is Test {
     function test_OnlyTheTimelockSetsTheSplit() public {
         address[] memory to = new address[](2);
         uint16[] memory bps = new uint16[](2);
-        (to[0], bps[0], to[1], bps[1]) = (POT, 9_000, L.IMD_BURN(), 1_000);
+        (to[0], bps[0], to[1], bps[1]) = (POT, 8_000, L.IMD_BURN(), 2_000);
         vm.prank(OWNER);
         vm.expectRevert(IMD6900RobinhoodLaunch.NotTimelock.selector);
         L.setPayees(to, bps);
@@ -421,13 +419,13 @@ contract IMD6900RobinhoodLaunchTest is Test {
         L.setPayees(to, bps);
         (address[] memory got, uint16[] memory gotBps) = L.payees();
         assertEq(got.length, 2);
-        assertEq(gotBps[0], 9_000);
+        assertEq(gotBps[0], 8_000);
         // and the new split is what the fees follow
         (address t,) = _launch();
         trader.swap(pool.poolKey(), true, -10 ether);
         uint256 potBefore = POT.balance;
         L.harvest();
-        assertApproxEqRel(POT.balance - potBefore, (POT.balance - potBefore + L.imdBucket()) * 9 / 10, 1e14, "90 / 10");
+        assertApproxEqRel(POT.balance - potBefore, (POT.balance - potBefore + L.imdBucket()) * 8 / 10, 1e14, "80 / 20");
         t;
     }
 
@@ -437,6 +435,13 @@ contract IMD6900RobinhoodLaunchTest is Test {
         _launch();
         PoolKey memory k = pool.poolKey();
         assertEq(k.fee, 44_400, "4.44%, a plain static fee: Uniswap routes it on its own");
+        assertEq(hook.perpFeeBps(), 444, "what the perps engine prices its own swaps at");
+        (address[] memory to, uint16[] memory bps) = L.payees();
+        assertEq(to.length, 2);
+        assertEq(to[0], L.POT_BRIDGE());
+        assertEq(bps[0], 9_000, "90% the NFT floor pot");
+        assertEq(to[1], L.IMD_BURN());
+        assertEq(bps[1], 1_000, "10% $IMD's canonical burn");
         trader.swap(k, true, -1 ether);
         (uint256 eth,) = pool.collect();
         assertApproxEqRel(eth, (1 ether + BUY) * 444 / 10_000, 0.001e18, "4.44% of the buys, the opening buy's included");
@@ -454,6 +459,7 @@ contract IMD6900RobinhoodLaunchTest is Test {
         uint128 l1 = pool.lowerFee(33_300);
         PoolKey memory neu = pool.poolKey();
         assertEq(neu.fee, 33_300);
+        assertEq(hook.perpFeeBps(), 333, "the engine sees the lower fee");
         (uint160 p1,, uint128 inPool) = pool.state();
         assertEq(p1, p0, "same price");
         assertApproxEqRel(l1, l0, 1e9, "all of the liquidity moved (to the wei of rounding)");

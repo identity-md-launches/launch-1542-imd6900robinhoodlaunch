@@ -145,13 +145,11 @@ contract RobinhoodForkTest is Test {
         emit log_named_decimal_uint("bought through the Universal Router", IERC20(t).balanceOf(buyer), 18);
         assertGt(IERC20(t).balanceOf(buyer), 0, "Uniswap's router trades the pool");
 
-        // the fees: ETH 70 / 30 to the pot bridge and ops, the coin's burned
+        // the fees: ETH 90% to the pot bridge (the NFT floor pot), 10% to $IMD's canonical burn; the coin's burned
         uint256 potBefore = POT.balance;
-        uint256 teamBefore = TEAM.balance;
         uint256 supply = IERC20(t).totalSupply();
         L.harvest();
         emit log_named_decimal_uint("to the pot bridge", POT.balance - potBefore, 18);
-        emit log_named_decimal_uint("to ops", TEAM.balance - teamBefore, 18);
         assertGt(POT.balance, potBefore);
         assertLt(IERC20(t).totalSupply(), supply);
         // the $IMD share: bought on $IMD's Robinhood pool, sent to its official burn executor
