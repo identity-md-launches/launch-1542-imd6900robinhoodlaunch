@@ -160,8 +160,9 @@ contract LaunchHandler is Test {
     function sendFees(uint256 amount, bool viaAddFees) external tick {
         amount = bound(amount, 1, 5 ether);
         vm.deal(address(this), amount);
-        if (viaAddFees) L.addFees{value: amount}();
-        else {
+        if (viaAddFees) {
+            L.addFees{value: amount}();
+        } else {
             (bool ok,) = address(L).call{value: amount}("");
             require(ok);
         }
@@ -172,8 +173,14 @@ contract LaunchHandler is Test {
         vm.deal(address(this), amount);
         address to = L.perpFeeTo();
         if (to == POT && potRefuses) {
-            vm.expectRevert();
+            // the sink refuses: the flush still succeeds, and all of it is kept here for the sink as owed
+            uint256 owedBefore = L.owed(to);
+            uint256 totalBefore = L.owedTotal();
+            uint256 heldBefore = address(L).balance;
             L.addPerpFees{value: amount}();
+            assertEq(L.owed(to) - owedBefore, amount, "perp fees refused: owed to the sink, all of it");
+            assertEq(L.owedTotal() - totalBefore, amount, "perp fees refused: counted in owedTotal");
+            assertEq(address(L).balance - heldBefore, amount, "perp fees refused: kept here");
             return;
         }
         uint256 before = to.balance;
@@ -199,10 +206,28 @@ contract LaunchHandler is Test {
     function burnImd() external tick {
         if (L.imdBucket() == 0) return;
         uint256 bucket = L.imdBucket();
+        uint256 last = L.lastImdBuy();
+        if (last != 0 && block.timestamp < last + L.IMD_BUY_GAP()) {
+            // within the gap: refused whole, the bucket untouched
+            vm.expectRevert(IMD6900RobinhoodLaunch.TooSoon.selector);
+            L.burnImd(0);
+            assertEq(L.imdBucket(), bucket, "a buy too soon spends nothing");
+            return;
+        }
         uint256 execBefore = IERC20(L.IMD()).balanceOf(L.imdBurn());
-        uint256 got = L.burnImd(0);
-        assertEq(IERC20(L.IMD()).balanceOf(L.imdBurn()) - execBefore, got, "the $IMD lands at the executor");
-        assertEq(bucket - L.imdBucket(), bucket < L.IMD_BUY_MAX() ? bucket : L.IMD_BUY_MAX(), "at most 0.1 ETH a call");
+        uint256 spend = bucket < L.IMD_BUY_MAX() ? bucket : L.IMD_BUY_MAX();
+        try L.burnImd(0) returns (uint256 got) {
+            assertGt(got, 0, "a buy that returns nothing reverts instead");
+            assertEq(IERC20(L.IMD()).balanceOf(L.imdBurn()) - execBefore, got, "the $IMD lands at the executor");
+            assertEq(bucket - L.imdBucket(), spend, "charged what the pool took: at most 0.1 ETH, all of it here");
+            assertEq(L.lastImdBuy(), block.timestamp, "the gap starts now");
+        } catch (bytes memory err) {
+            // the only refusal left: a dust bucket the pool's fee rounds to nothing, which spends nothing
+            assertEq(bytes4(err), IMD6900RobinhoodLaunch.Short.selector, "burnImd refused for another reason");
+            assertLt(spend, 1e6, "a buy of more than dust must go through");
+            assertEq(L.imdBucket(), bucket, "a refused buy spends nothing");
+            assertEq(L.lastImdBuy(), last, "and starts no gap");
+        }
     }
 
     function setPotRefuses(bool on) external tick {
@@ -281,6 +306,9 @@ contract LaunchHandler is Test {
         uint256 eth = L.sellHeld(amount, 0, R);
         assertEq(R.balance - before, eth, "the ETH lands where told");
         assertGe(L.excessHeld(), held - amount, "what the pool can't take stays held");
+        if (L.excessHeld() > held - amount) {
+            assertFalse(_poolHasEth(), "a sale the pool took only part of must have drained it");
+        }
     }
 
     function recoverEth(uint256 amount) external tick {
@@ -425,12 +453,20 @@ contract IMD6900InvariantTest is Test {
         assertEq(IERC20(token).balanceOf(address(pool)), 0);
     }
 
-    /// All of the current pool's liquidity is the one locked position, and every pool it left is empty
+    /// All of the current pool's liquidity is the one locked position, and every pool it left is empty. The position
+    /// runs from the lowest price up to the opening tick: while the price is under that tick it is the pool's whole
+    /// in-range liquidity; at or above it (the pool holds no ETH, as at the opening or after a sale that drained it)
+    /// nothing is in range, and the position still holds every coin
     function invariant_AllTheLiquidityIsTheLockedPosition() public view {
         PoolId id = pool.poolId();
         uint128 liq = pool.liquidity();
         assertGt(liq, 0);
-        assertEq(PM.getLiquidity(id), liq, "in-range liquidity is the position's");
+        (uint160 p,,) = pool.state();
+        if (p < TickMath.getSqrtPriceAtTick(pool.upperTick())) {
+            assertEq(PM.getLiquidity(id), liq, "in-range liquidity is the position's");
+        } else {
+            assertEq(PM.getLiquidity(id), 0, "above the opening tick nothing is in range");
+        }
         bytes32 pid = Position.calculatePositionKey(address(pool), pool.LOWER_TICK(), pool.upperTick(), bytes32(0));
         assertEq(PM.getPositionLiquidity(id, pid), liq, "the position's liquidity is what the pool records");
         for (uint256 i; i < h.oldPoolCount(); ++i) {

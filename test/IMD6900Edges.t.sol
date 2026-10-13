@@ -26,34 +26,57 @@ contract MoodyEngine {
     uint8 public status;
     bool public broken;
     uint256 public open;
-    function set(uint8 s, bool b, uint256 o) external { (status, broken, open) = (s, b, o); }
+
+    function set(uint8 s, bool b, uint256 o) external {
+        (status, broken, open) = (s, b, o);
+    }
+
     function sweepLiquidations(address, int256, bool, uint160) external view returns (uint8) {
         if (broken) revert("sweep down");
         return status;
     }
-    function openCount() external view returns (uint256) { return open; }
+
+    function openCount() external view returns (uint256) {
+        return open;
+    }
 }
 
 /// A trader that stops at a price of its choosing
 contract LimitTrader {
     IPoolManager immutable pm;
-    PoolKey key; bool buy; int256 amt; uint160 limit;
-    constructor(IPoolManager pm_) { pm = pm_; }
+    PoolKey key;
+    bool buy;
+    int256 amt;
+    uint160 limit;
+
+    constructor(IPoolManager pm_) {
+        pm = pm_;
+    }
+
     function swap(PoolKey calldata k, bool buy_, int256 amt_, uint160 limit_) external returns (BalanceDelta d) {
         (key, buy, amt, limit) = (k, buy_, amt_, limit_);
         d = abi.decode(pm.unlock(""), (BalanceDelta));
     }
+
     function unlockCallback(bytes calldata) external returns (bytes memory) {
         BalanceDelta d = pm.swap(key, SwapParams(buy, amt, limit), "");
         _settle(key.currency0, d.amount0());
         _settle(key.currency1, d.amount1());
         return abi.encode(d);
     }
+
     function _settle(Currency c, int128 v) internal {
         if (v < 0) {
-            if (c.isAddressZero()) pm.settle{value: uint128(-v)}();
-            else { pm.sync(c); IERC20(Currency.unwrap(c)).transfer(address(pm), uint128(-v)); pm.settle(); }
-        } else if (v > 0) pm.take(c, address(this), uint128(v));
+            if (c.isAddressZero()) {
+                pm.settle{value: uint128(-v)}();
+            } else {
+                pm.sync(c);
+                IERC20(Currency.unwrap(c)).transfer(address(pm), uint128(-v));
+                pm.settle();
+            }
+        } else if (v > 0) {
+            pm.take(c, address(this), uint128(v));
+        }
     }
     receive() external payable {}
 }
@@ -94,10 +117,14 @@ contract IMD6900EdgesTest is Test {
         hook = L.createHook(HookSalt.mine(L));
         pool = L.pool();
         SALT = CoinSalt.mine(L);
-        imdstr.mint(A, AA); imdstr.mint(B, BB); imdstr.mint(C, CC);
+        imdstr.mint(A, AA);
+        imdstr.mint(B, BB);
+        imdstr.mint(C, CC);
         trader = new Trader(PM);
         vm.deal(address(trader), 1_000 ether);
-        leaves.push(_leaf(A, AA)); leaves.push(_leaf(B, BB)); leaves.push(_leaf(C, CC));
+        leaves.push(_leaf(A, AA));
+        leaves.push(_leaf(B, BB));
+        leaves.push(_leaf(C, CC));
     }
 
     /*                             BEFORE THE LAUNCH                          */
@@ -215,7 +242,9 @@ contract IMD6900EdgesTest is Test {
         vm.prank(OWNER);
         (address t, uint256 bought) = L.launch{value: BUY}(SALT, expected, _sqrtPrice(OPEN_MC), 0, address(0));
         assertEq(IERC20(t).balanceOf(address(L)), 0, "no reserve, the excess burned");
-        assertEq(L.launchExcess(), bought + (SUPPLY - bought - IERC20(t).balanceOf(address(PM))), "the buy and the dust");
+        assertEq(
+            L.launchExcess(), bought + (SUPPLY - bought - IERC20(t).balanceOf(address(PM))), "the buy and the dust"
+        );
         assertEq(IERC20(t).totalSupply(), IERC20(t).balanceOf(address(PM)), "all that is left is in the pool");
         bytes32[] memory none;
         vm.expectRevert(IMD6900RobinhoodLaunch.BadProof.selector);
@@ -312,7 +341,9 @@ contract IMD6900EdgesTest is Test {
         vm.expectRevert(IMD6900RobinhoodLaunch.BadPayees.selector);
         L.setPayees(to, bps); // none
         (to, bps) = (new address[](9), new uint16[](9));
-        for (uint256 i; i < 9; ++i) (to[i], bps[i]) = (address(uint160(i + 1)), i == 0 ? 2_000 : 1_000);
+        for (uint256 i; i < 9; ++i) {
+            (to[i], bps[i]) = (address(uint160(i + 1)), i == 0 ? 2_000 : 1_000);
+        }
         vm.expectRevert(IMD6900RobinhoodLaunch.BadPayees.selector);
         L.setPayees(to, bps); // nine
         (to, bps) = (new address[](2), new uint16[](1));
@@ -330,7 +361,9 @@ contract IMD6900EdgesTest is Test {
         vm.expectRevert(IMD6900RobinhoodLaunch.BadPayees.selector);
         L.setPayees(to, bps); // 10,001
         (to, bps) = (new address[](8), new uint16[](8));
-        for (uint256 i; i < 8; ++i) (to[i], bps[i]) = (address(uint160(0x100 + i)), 1_250);
+        for (uint256 i; i < 8; ++i) {
+            (to[i], bps[i]) = (address(uint160(0x100 + i)), 1_250);
+        }
         L.setPayees(to, bps); // eight, the most
         vm.stopPrank();
         (address[] memory got, uint16[] memory gotBps) = L.payees();
@@ -441,16 +474,66 @@ contract IMD6900EdgesTest is Test {
         L.recoverEth(address(this), 0);
     }
 
-    function test_PerpFeesRevertWhenTheirLandingRefuses() public {
+    /// The perps engine's flush never fails on its sink: what the landing refuses is kept here for it as owed, out of
+    /// the split, retried by payOwed once it takes ETH again, and the timelock's recoverEth is the way out meanwhile
+    function test_PerpFeesRefusedByTheirLandingAreOwedNotLost() public {
         vm.etch(POT, address(new Refuser()).code);
-        vm.deal(address(this), 1 ether);
+        vm.deal(address(this), 3 ether);
+        L.addPerpFees{value: 1 ether}();
+        assertEq(address(L).balance, 1 ether, "kept here");
+        assertEq(L.owed(POT), 1 ether, "for the pot");
+        assertEq(L.owedTotal(), 1 ether);
+        L.addPerpFees{value: 1 ether}(); // twice: it adds up, nothing overwritten
+        assertEq(L.owed(POT), 2 ether);
+        assertEq(L.owedTotal(), 2 ether);
+        // still refusing: the retry fails whole and the books don't move
         vm.expectRevert();
-        L.addPerpFees{value: 1 ether}(); // nothing kept here, nothing lost: the engine's flush fails whole
-        assertEq(address(L).balance, 0);
+        L.payOwed(POT);
+        assertEq(L.owed(POT), 2 ether);
+        assertEq(L.owedTotal(), 2 ether);
+        // repointed: the new landing gets the next flush straight, the old debt stays the pot's
         vm.prank(TL);
         L.setPerpFeeTo(R);
         L.addPerpFees{value: 1 ether}();
         assertEq(R.balance, 1 ether);
+        assertEq(L.owed(R), 0);
+        assertEq(L.owed(POT), 2 ether);
+        // the pot takes ETH again: anyone retries, all of it at once
+        vm.etch(POT, "");
+        uint256 before = POT.balance;
+        assertEq(L.payOwed(POT), 2 ether);
+        assertEq(POT.balance - before, 2 ether);
+        assertEq(L.owed(POT), 0);
+        assertEq(L.owedTotal(), 0);
+        assertEq(address(L).balance, 0);
+        vm.expectRevert(IMD6900RobinhoodLaunch.NoEth.selector);
+        L.payOwed(POT); // nothing left to retry
+    }
+
+    /// After the launch, a refused perp flush stays out of the split: the next split pays only the fees, and a payee
+    /// list that names the pot again pays the debt with its share
+    function test_OwedPerpFeesStayOutOfTheSplitUntilThePotTakesThem() public {
+        _launch();
+        vm.etch(POT, address(new Refuser()).code);
+        vm.deal(address(this), 2 ether);
+        L.addPerpFees{value: 1 ether}();
+        assertEq(L.owed(POT), 1 ether);
+        L.addFees{value: 1 ether}();
+        assertEq(L.split(), 1 ether, "the split is the fees alone, never the pot's debt");
+        assertEq(L.imdBucket(), 0.1 ether);
+        assertEq(L.owed(POT), 1.9 ether, "the pot refused its share of the split too");
+        assertEq(L.owedTotal(), 1.9 ether);
+        assertEq(address(L).balance, 2 ether);
+        assertEq(L.split(), 0, "nothing beyond the bucket and the owed");
+        vm.etch(POT, "");
+        vm.deal(address(this), 1 ether);
+        L.addFees{value: 1 ether}();
+        uint256 before = POT.balance;
+        assertEq(L.split(), 1 ether);
+        assertEq(POT.balance - before, 0.9 ether + 1.9 ether, "its share and everything it was owed");
+        assertEq(L.owed(POT), 0);
+        assertEq(L.owedTotal(), 0);
+        assertEq(address(L).balance, L.imdBucket());
     }
 
     function test_BurnImdHoldsItsFloor() public {
@@ -497,7 +580,8 @@ contract IMD6900EdgesTest is Test {
         k.fee = 10_000; // the same pair and hook at another fee: the hook refuses anyone but the locked pool
         vm.expectRevert();
         PM.initialize(k, _sqrtPrice(OPEN_MC));
-        PoolKey memory other = PoolKey(Currency.wrap(address(0)), Currency.wrap(address(imdstr)), 44_400, 60, IHooks(address(hook)));
+        PoolKey memory other =
+            PoolKey(Currency.wrap(address(0)), Currency.wrap(address(imdstr)), 44_400, 60, IHooks(address(hook)));
         vm.expectRevert();
         PM.initialize(other, _sqrtPrice(OPEN_MC));
         t;
@@ -573,7 +657,9 @@ contract IMD6900EdgesTest is Test {
     /*                               THE POOL                                */
 
     /// forge-config: default.fuzz.runs = 256
-    function testFuzz_LowerFeeAfterAnyTrades(uint256 buyEth, uint256 sellFrac, uint256 newFee, bool collectFirst) public {
+    function testFuzz_LowerFeeAfterAnyTrades(uint256 buyEth, uint256 sellFrac, uint256 newFee, bool collectFirst)
+        public
+    {
         (address t,) = _launch();
         PoolKey memory old = pool.poolKey();
         buyEth = bound(buyEth, 1e9, 500 ether);
@@ -613,13 +699,19 @@ contract IMD6900EdgesTest is Test {
         IERC20(t).transfer(address(trader), AA);
         vm.stopPrank();
         uint256 all = IERC20(t).balanceOf(address(trader));
-        assertEq(all, L.launchExcess() + AA, "the excess and A's claim: every coin outside the pool but B's and C's reserve");
+        assertEq(
+            all, L.launchExcess() + AA, "the excess and A's claim: every coin outside the pool but B's and C's reserve"
+        );
         trader.swap(pool.poolKey(), false, -int256(all));
         (uint160 p,,) = pool.state();
         uint160 top = TickMath.getSqrtPriceAtTick(pool.upperTick());
         assertLt(p, top, "under the top: the fee kept some of the coins back");
         assertGt(p, top - top / 20, "but within a few percent of it");
-        assertLt(address(PM).balance, 1 ether, "most of the ETH bought back (what's left: the fees earned, and the fee's bite)");
+        assertLt(
+            address(PM).balance,
+            1 ether,
+            "most of the ETH bought back (what's left: the fees earned, and the fee's bite)"
+        );
         uint128 l0 = pool.liquidity();
         vm.prank(TL);
         uint128 l1 = pool.lowerFee(33_300);
