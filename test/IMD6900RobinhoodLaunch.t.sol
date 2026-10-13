@@ -18,7 +18,7 @@ import {IMD6900} from "../src/IMD6900.sol";
 import {IMD6900Hook} from "../src/IMD6900Hook.sol";
 import {IMD6900LockedPool} from "../src/IMD6900LockedPool.sol";
 import {IMD6900RobinhoodLaunch} from "../src/IMD6900RobinhoodLaunch.sol";
-import {HookSalt} from "./HookSalt.sol";
+import {HookSalt, CoinSalt} from "./HookSalt.sol";
 
 interface IERC20 {
     function balanceOf(address) external view returns (uint256);
@@ -129,6 +129,7 @@ contract IMD6900RobinhoodLaunchTest is Test {
     uint256 constant BB = 20_000_000 ether;
     uint256 constant CC = 3_935_747 ether;
     bytes32[] leaves;
+    bytes32 SALT;
 
     function setUp() public {
         PM = IPoolManager(address(new PoolManager(address(this))));
@@ -136,6 +137,7 @@ contract IMD6900RobinhoodLaunchTest is Test {
         L = new IMD6900RobinhoodLaunch(OWNER, PM, address(imdstr), TL);
         hook = L.createHook(HookSalt.mine(L));
         pool = L.pool();
+        SALT = CoinSalt.mine(L); // the coin's 0x6900 salt, as script/mine.sh finds it
         imdstr.mint(A, AA); imdstr.mint(B, BB); imdstr.mint(C, CC);
         trader = new Trader(PM);
         vm.deal(address(trader), 100 ether);
@@ -213,7 +215,7 @@ contract IMD6900RobinhoodLaunchTest is Test {
 
     function test_LaunchesAtEthereumsPrice() public {
         (address t, uint256 bought) = _launch();
-        assertEq(t, L.tokenAddress(bytes32(0)));
+        assertEq(t, L.tokenAddress(SALT));
         assertEq(L.token(), t);
         emit log_named_decimal_uint("opening buy, coins", bought, 18);
         // constant product from 19.18 ETH: 2.81 ETH less the pool's 4.44% lands ~12.28%
@@ -230,10 +232,26 @@ contract IMD6900RobinhoodLaunchTest is Test {
         assertApproxEqRel(mc, 24.93 ether, 0.01e18, "Ethereum's price, about");
     }
 
+    function test_TheCoinIsAt0x6900() public {
+        (address t,) = _launch();
+        assertEq(uint160(t) >> 144, 0x6900, "0x6900...");
+        emit log_named_address("the coin", t);
+    }
+
+    function test_RefusesAnAddressThatIsnt0x6900() public {
+        _claims();
+        vm.deal(OWNER, BUY);
+        address plain = L.tokenAddress(bytes32(uint256(0xdead)));
+        assertTrue(uint160(plain) >> 144 != 0x6900);
+        vm.prank(OWNER);
+        vm.expectRevert(abi.encodeWithSelector(IMD6900RobinhoodLaunch.NotVanity.selector, plain));
+        L.launch{value: BUY}(bytes32(uint256(0xdead)), plain, _sqrtPrice(OPEN_MC), 0, address(0));
+    }
+
     function test_RefusesTheWrongAddress() public {
         _claims();
         vm.deal(OWNER, BUY);
-        (address landed, address mined) = (L.tokenAddress(bytes32(uint256(1))), L.tokenAddress(bytes32(0)));
+        (address landed, address mined) = (L.tokenAddress(bytes32(uint256(1))), L.tokenAddress(SALT));
         vm.prank(OWNER);
         vm.expectRevert(abi.encodeWithSelector(IMD6900RobinhoodLaunch.NotWhereMined.selector, landed));
         L.launch{value: BUY}(bytes32(uint256(1)), mined, _sqrtPrice(OPEN_MC), 0, address(0));
@@ -242,9 +260,9 @@ contract IMD6900RobinhoodLaunchTest is Test {
     function test_OnlyTheOwnerLaunches() public {
         _claims();
         vm.deal(address(this), BUY);
-        address expected_ = L.tokenAddress(bytes32(0));
+        address expected_ = L.tokenAddress(SALT);
         vm.expectRevert(Ownable.Unauthorized.selector);
-        L.launch{value: BUY}(bytes32(0), expected_, _sqrtPrice(OPEN_MC), 0, address(0));
+        L.launch{value: BUY}(SALT, expected_, _sqrtPrice(OPEN_MC), 0, address(0));
     }
 
     function test_LaunchesOnce() public {
@@ -260,18 +278,18 @@ contract IMD6900RobinhoodLaunchTest is Test {
         vm.prank(OWNER);
         L.setClaims(_root(), 300_000_000 ether, block.timestamp + 100 days);
         vm.deal(OWNER, BUY);
-        address expected_ = L.tokenAddress(bytes32(0));
+        address expected_ = L.tokenAddress(SALT);
         vm.prank(OWNER);
         vm.expectRevert(); // Short: 2.81 ETH can't land 300M at this price
-        L.launch{value: BUY}(bytes32(0), expected_, _sqrtPrice(OPEN_MC), 0, address(0));
+        L.launch{value: BUY}(SALT, expected_, _sqrtPrice(OPEN_MC), 0, address(0));
     }
 
     function test_SendsTheExcessWhereTold() public {
         _claims();
         vm.deal(OWNER, BUY);
-        address expected_ = L.tokenAddress(bytes32(0));
+        address expected_ = L.tokenAddress(SALT);
         vm.prank(OWNER);
-        (address t,) = L.launch{value: BUY}(bytes32(0), expected_, _sqrtPrice(OPEN_MC), 0, TL);
+        (address t,) = L.launch{value: BUY}(SALT, expected_, _sqrtPrice(OPEN_MC), 0, TL);
         assertEq(IERC20(t).balanceOf(TL), L.launchExcess());
         assertEq(IERC20(t).totalSupply(), SUPPLY);
     }
@@ -279,9 +297,9 @@ contract IMD6900RobinhoodLaunchTest is Test {
     function test_KeepsTheExcessForTheTimelock() public {
         _claims();
         vm.deal(OWNER, BUY);
-        address expected_ = L.tokenAddress(bytes32(0));
+        address expected_ = L.tokenAddress(SALT);
         vm.prank(OWNER);
-        (address t,) = L.launch{value: BUY}(bytes32(0), expected_, _sqrtPrice(OPEN_MC), 0, address(L));
+        (address t,) = L.launch{value: BUY}(SALT, expected_, _sqrtPrice(OPEN_MC), 0, address(L));
         uint256 excess = L.excessHeld();
         assertGt(excess, 0);
         assertEq(IERC20(t).balanceOf(address(L)), AA + BB + CC + excess, "the reserve and the excess, both here");
@@ -323,10 +341,10 @@ contract IMD6900RobinhoodLaunchTest is Test {
         vm.prank(OWNER);
         L.setClaims(_root(), AA + BB + CC, block.timestamp + 30 days);
         vm.deal(OWNER, BUY);
-        address expected_ = L.tokenAddress(bytes32(0));
+        address expected_ = L.tokenAddress(SALT);
         vm.prank(OWNER);
         vm.expectRevert(IMD6900RobinhoodLaunch.BadClaims.selector);
-        L.launch{value: BUY}(bytes32(0), expected_, _sqrtPrice(OPEN_MC), 0, address(0));
+        L.launch{value: BUY}(SALT, expected_, _sqrtPrice(OPEN_MC), 0, address(0));
     }
 
     /*                               THE POOL                               */
@@ -646,6 +664,40 @@ contract IMD6900RobinhoodLaunchTest is Test {
         assertLe(IERC20(t).balanceOf(address(L)), 1e18, "dust");
     }
 
+    function test_PerpFeesGoAllToThePot() public {
+        _launch();
+        uint256 potBefore = POT.balance;
+        vm.deal(address(0xE9), 1 ether);
+        vm.prank(address(0xE9)); // the perps engine's flushFees
+        L.addPerpFees{value: 1 ether}();
+        assertEq(POT.balance - potBefore, 1 ether, "all of it, as ETH, to the pot bridge");
+        assertEq(address(L).balance, 0, "none split or kept");
+        vm.prank(OWNER);
+        vm.expectRevert(IMD6900RobinhoodLaunch.NotTimelock.selector);
+        L.setPerpFeeTo(OWNER);
+        vm.prank(TL);
+        vm.expectRevert(IMD6900RobinhoodLaunch.BadPayees.selector);
+        L.setPerpFeeTo(address(0));
+        vm.prank(TL);
+        L.setPerpFeeTo(R);
+        vm.deal(address(0xE9), 1 ether);
+        vm.prank(address(0xE9));
+        L.addPerpFees{value: 1 ether}();
+        assertEq(R.balance, 1 ether, "where the timelock points it");
+    }
+
+    function test_OnlyTheTimelockRepointsTheBurnExecutor() public {
+        assertEq(L.imdBurn(), 0x4D6537ec564aFf82eABb1Ce5f355E817cBEA1e07, "IMD's canonical Robinhood burn executor");
+        vm.prank(OWNER);
+        vm.expectRevert(IMD6900RobinhoodLaunch.NotTimelock.selector);
+        L.setImdBurn(R);
+        vm.prank(TL);
+        L.setImdBurn(R);
+        assertEq(L.imdBurn(), R);
+        (address[] memory to,) = L.payees();
+        assertEq(to[1], R, "the default split follows it");
+    }
+
     /*                         OWNER AND TIMELOCK                           */
 
     function test_OnlyTheTimelockRecoversEth() public {
@@ -698,9 +750,9 @@ contract IMD6900RobinhoodLaunchTest is Test {
     function _launch(address excessTo) internal returns (address t, uint256 bought) {
         _claims();
         vm.deal(OWNER, BUY);
-        address expected_ = L.tokenAddress(bytes32(0));
+        address expected_ = L.tokenAddress(SALT);
         vm.prank(OWNER);
-        (t, bought) = L.launch{value: BUY}(bytes32(0), expected_, _sqrtPrice(OPEN_MC), 0, excessTo);
+        (t, bought) = L.launch{value: BUY}(SALT, expected_, _sqrtPrice(OPEN_MC), 0, excessTo);
     }
 
     function _claims() internal {

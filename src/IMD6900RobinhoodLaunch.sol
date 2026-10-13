@@ -57,6 +57,8 @@ contract IMD6900RobinhoodLaunch is Ownable, ReentrancyGuard {
     ///         IMD's burn receiver on Base). As a payee, the executor's share buys $IMD rather than being sent as ETH.
     address public constant IMD = 0x5F7Bb59365ce557C26dbcAa4EE9d39A4b95B7127;
     address public constant IMD_BURN = 0x4D6537ec564aFf82eABb1Ce5f355E817cBEA1e07;
+    /// @notice The coin's address starts with this (its top 16 bits): {launch} refuses any other
+    uint16 public constant VANITY = 0x6900;
     uint16 public constant IMD_BPS = 1_000;
     /// @notice The most one {burnImd} spends: under what sandwiching it would be worth through two 1% fees
     uint256 public constant IMD_BUY_MAX = 0.1 ether;
@@ -102,6 +104,13 @@ contract IMD6900RobinhoodLaunch is Ownable, ReentrancyGuard {
     int24 public imdPoolTickSpacing = 100;
     address public imdPoolHooks;
 
+    /// @notice IMD's burn executor on Robinhood, where the $IMD share goes: the canonical one ({IMD_BURN}) unless the
+    ///         timelock repoints it ({setImdBurn}), should IMD ever move it
+    address public imdBurn = IMD_BURN;
+    /// @notice Where the perps engine's fees go (what its stakers and insurance don't keep): all of it as ETH to the pot
+    ///         bridge, so the NFT floor pot on Ethereum, unless the timelock repoints it ({setPerpFeeTo})
+    address public perpFeeTo = POT_BRIDGE;
+
     /// @dev The timelock's payees once set (fixed-size); until then 90% the pot bridge, 10% $IMD's burn
     address[8] internal _payees;
     uint16[8] internal _shares;
@@ -124,6 +133,9 @@ contract IMD6900RobinhoodLaunch is Ownable, ReentrancyGuard {
     event HeldSold(uint256 coins, uint256 eth, address to);
     event ImdBurned(uint256 ethIn, uint256 imd);
     event ImdPoolSet(uint24 fee, int24 tickSpacing, address hooks);
+    event ImdBurnSet(address executor);
+    event PerpFeeToSet(address to);
+    event PerpFeesForwarded(address to, uint256 amount);
 
     error HookExists();
     error BadHook();
@@ -131,6 +143,7 @@ contract IMD6900RobinhoodLaunch is Ownable, ReentrancyGuard {
     error NotLaunched();
     error NoEth();
     error NotWhereMined(address token);
+    error NotVanity(address token);
     error Short(uint256 bought);
     error BadClaims();
     error BadProof();
@@ -188,6 +201,14 @@ contract IMD6900RobinhoodLaunch is Ownable, ReentrancyGuard {
         emit FeesReceived(msg.sender, msg.value);
     }
 
+    /// @notice The perps engine's fees (PerpEngine.flushFees, with this contract as its fee sink): straight on to
+    ///         {perpFeeTo}, none of it split or kept here
+    function addPerpFees() external payable {
+        address to = perpFeeTo;
+        SafeTransferLib.safeTransferETH(to, msg.value);
+        emit PerpFeesForwarded(to, msg.value);
+    }
+
     /// @notice The coin's address for `salt`: what the owner mines a vanity salt against
     function tokenAddress(bytes32 salt) public view returns (address) {
         bytes32 h = keccak256(
@@ -207,7 +228,7 @@ contract IMD6900RobinhoodLaunch is Ownable, ReentrancyGuard {
         uint256 n = _payeeCount;
         if (n == 0) {
             (to, bps) = (new address[](2), new uint16[](2));
-            (to[0], bps[0], to[1], bps[1]) = (POT_BRIDGE, POT_BPS, IMD_BURN, IMD_BPS);
+            (to[0], bps[0], to[1], bps[1]) = (POT_BRIDGE, POT_BPS, imdBurn, IMD_BPS);
             return (to, bps);
         }
         (to, bps) = (new address[](n), new uint16[](n));
@@ -258,6 +279,7 @@ contract IMD6900RobinhoodLaunch is Ownable, ReentrancyGuard {
         if (claimTotal != 0 && claimDeadline < block.timestamp + MIN_CLAIM_WINDOW) revert BadClaims();
         t = address(new IMD6900{salt: salt}(address(this)));
         if (t != expectedToken) revert NotWhereMined(t);
+        if (uint160(t) >> 144 != VANITY) revert NotVanity(t);
         token = t;
 
         SafeTransferLib.safeApprove(t, address(pool), SUPPLY);
@@ -373,6 +395,22 @@ contract IMD6900RobinhoodLaunch is Ownable, ReentrancyGuard {
     }
 
     /// @notice Repoints $IMD's buys to another of its Robinhood pools (ETH / $IMD), behind the timelock's delay
+    /// @notice Repoints the $IMD share to another burn executor (set the payees again if they name the old one)
+    function setImdBurn(address executor) external {
+        if (msg.sender != timelock) revert NotTimelock();
+        if (executor == address(0)) revert BadPayees();
+        imdBurn = executor;
+        emit ImdBurnSet(executor);
+    }
+
+    /// @notice Repoints the perps engine's fees
+    function setPerpFeeTo(address to) external {
+        if (msg.sender != timelock) revert NotTimelock();
+        if (to == address(0) || to == address(this)) revert BadPayees();
+        perpFeeTo = to;
+        emit PerpFeeToSet(to);
+    }
+
     function setImdPool(uint24 fee, int24 tickSpacing, address hooks) external {
         if (msg.sender != timelock) revert NotTimelock();
         (imdPoolFee, imdPoolTickSpacing, imdPoolHooks) = (fee, tickSpacing, hooks);
@@ -409,7 +447,7 @@ contract IMD6900RobinhoodLaunch is Ownable, ReentrancyGuard {
         for (uint256 i; i < to.length; ++i) {
             uint256 part = (amount * bps[i]) / 10_000;
             if (part == 0) continue;
-            if (to[i] == IMD_BURN) {
+            if (to[i] == imdBurn) {
                 imdBucket += part;
                 continue;
             }
@@ -428,7 +466,7 @@ contract IMD6900RobinhoodLaunch is Ownable, ReentrancyGuard {
         imdBucket -= spend;
         imd = abi.decode(poolManager.unlock(abi.encode(uint8(1), spend)), (uint256));
         if (imd < minImd) revert Short(imd);
-        SafeTransferLib.safeTransfer(IMD, IMD_BURN, imd);
+        SafeTransferLib.safeTransfer(IMD, imdBurn, imd);
         imdBurned += imd;
         emit ImdBurned(spend, imd);
     }

@@ -16,6 +16,10 @@
 #   script/launch.sh programmable  the Programmable plan for the same launch(): built, packed and preflighted
 #   script/launch.sh submit        creates it on Programmable (their manual review starts), then `review` polls it
 #   script/launch.sh review        the plan's state on Programmable
+#   script/launch.sh pot           after the launch, the fees on their way (anyone may do each part): harvest (90% to
+#                                  the pot bridge, 10% set aside for $IMD), burnImd (buys $IMD for IMD's canonical burn
+#                                  executor), bridge (Robinhood -> Across -> Ethereum, from 0.05 ETH), then on Ethereum
+#                                  depositBridgedFees (what Across delivered joins the NFT pot). ETH_RPC_URL for Ethereum.
 #   script/launch.sh recover       after the launch, the opening buy's ETH back: queues on the timelock the sale of the coins
 #                                  the launch holds (END_CLAIMS=1: the unclaimed reserve too, claims end) to the team wallet
 #   script/launch.sh recover-exec  runs it once the 12h delay is over
@@ -31,6 +35,10 @@ PM=0x8366a39CC670B4001A1121B8F6A443A643e40951
 IMDSTR=0x0000198C940D8cD70Cb9ACeC5E3af8216ac57d2F
 TL=0x16D3f65B708883DF042d98E1C7a49B32A33E2A14
 PONS_LAUNCHER=0xE0aBb21F15766BE162429f46F494617eB5EF6Ba0
+POT_BRIDGE=0xc39e650a24985C2bBA9FD83C81041B8f3E3f9EDd                   # Robinhood -> Across -> the pot hook on Ethereum
+POT_HOOK=0xA16026A28aA581AA96713d20C608Da7F8db86444                     # Ethereum: depositBridgedFees() -> the NFT pot
+WETH_ETHEREUM=0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2
+ETH_RPC="${ETH_RPC_URL:-https://ethereum-rpc.publicnode.com}"
 API=https://api.programmable.market/v4/chains/4663
 PACKER=${PACKER:-$PWD/.programmable/request-packer.mjs}  # Programmable's own packer, fetched for the manifest below
 STATE=${STATE:-launch.state}  # LAUNCH, SALT, TOKEN, PLAN_ID as they come
@@ -160,6 +168,24 @@ import json; d=json.load(open('submitted.json')); print(json.dumps({k: d.get(k) 
     python3 -c "
 import json; d=json.load(open('review.json')); print(json.dumps({k: d.get(k) for k in ('status','manualReview','walletUrl','continuation')}, indent=1)[:2000])"
     ;;
+  pot)
+    need LAUNCH deploy
+    [ "$(c $LAUNCH 'token()(address)')" != 0x0000000000000000000000000000000000000000 ] || { echo "not launched yet"; exit 1; }
+    POT0=$(cast balance $POT_BRIDGE --rpc-url "$RPC")
+    tx $LAUNCH 'harvest()' && echo "harvested: pot bridge +$(e $(python3 -c "print($(cast balance $POT_BRIDGE --rpc-url "$RPC") - $POT0)")) ETH, \$IMD bucket $(e $(c $LAUNCH 'imdBucket()(uint256)')) ETH"
+    if [ "$(c $LAUNCH 'imdBucket()(uint256)')" != 0 ]; then
+      Q=$(cast call $LAUNCH 'burnImd(uint256)(uint256)' 0 --from $TEAM --rpc-url "$RPC" | awk '{print $1}')  # the buy's quote
+      tx $LAUNCH 'burnImd(uint256)' $(python3 -c "print($Q * 97 // 100)") && echo "\$IMD to IMD's burn executor: ~$(e $Q) \$IMD"
+    fi
+    PEND=$(c $POT_BRIDGE 'pending()(uint256)')
+    if python3 -c "import sys; sys.exit(0 if $PEND >= 5 * 10**16 else 1)"; then
+      tx $POT_BRIDGE 'bridge()' && echo "bridged $(e $PEND) ETH to Ethereum (Across fills it in minutes)"
+    else echo "pot bridge holds $(e $PEND) ETH: bridges from 0.05"; fi
+    W=$(cast call $WETH_ETHEREUM 'balanceOf(address)(uint256)' $POT_HOOK --rpc-url "$ETH_RPC" | awk '{print $1}')
+    if [ "$W" != 0 ]; then
+      cast send $POT_HOOK 'depositBridgedFees()' "${SIGN[@]}" --rpc-url "$ETH_RPC" >/dev/null && echo "Ethereum: $(e $W) ETH into the NFT pot"
+    else echo "Ethereum: nothing waiting at the pot hook"; fi
+    ;;
   recover)
     need LAUNCH deploy
     [ "$(c $LAUNCH 'token()(address)')" != 0x0000000000000000000000000000000000000000 ] || { echo "not launched: the ETH is the team wallet's (withdrawEth if it was sent)"; exit 1; }
@@ -192,5 +218,5 @@ q=2**96; sq,l,dy=$SQ,$LIQ,$AMOUNT*(1-$FEE/1e6); sq2=sq+dy*q/l; print(int(l*q*(sq
     tx $TL 'executeBatch(address[],uint256[],bytes[],bytes32,bytes32)' "$RECOVER_TARGETS" "$VALUES" "$RECOVER_DATAS" $ZERO $RECOVER_SALT
     echo "back to the team wallet: $(e $(python3 -c "print($(cast balance $TEAM --rpc-url "$RPC") - $B0)")) ETH (less its gas)"
     ;;
-  *) sed -n 2,22p "$0"; exit 1 ;;
+  *) sed -n 2,26p "$0"; exit 1 ;;
 esac

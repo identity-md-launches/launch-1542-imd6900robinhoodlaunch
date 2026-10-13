@@ -9,7 +9,7 @@ and the old IMDSTR claims the new coin 1:1, up to each holder's snapshot balance
 
 | | |
 |---|---|
-| `src/IMD6900RobinhoodLaunch.sol` | What the swarm deploys. Its constructor creates the locked pool and calls nothing that existed before it (~6.2M gas, the same from any deployer). `createHook(salt)` (anyone, once) then creates the hook at a salt mined off-chain for its address. Then the launch, the claims, the fee split. |
+| `src/IMD6900RobinhoodLaunch.sol` | What the swarm deploys. Its constructor creates the locked pool and calls nothing that existed before it (~6.4M gas, the same from any deployer). `createHook(salt)` (anyone, once) then creates the hook at a salt mined off-chain for its address. Then the launch, the claims, the fee split. |
 | `src/IMD6900.sol` | The coin: 1B minted once to the launch. No owner, no mint, no tax, no pause, no blacklist, no limits, no proxy. Holders can burn their own. |
 | `src/IMD6900LockedPool.sol` | Owns the pool's one position. No owner, no way to take liquidity out. `collect()` (anyone): ETH fees to the split, IMD6900 fees burned. `lowerFee(fee)` (the timelock only, lower only): moves the position, in one transaction, into a new pool at the lower fee and the same price. |
 | `src/IMD6900Hook.sol` | ETH / IMD6900 only, at the locked pool's static fee, initialized by the locked pool only (at the launch, and at each lower fee it moves to), liquidity from it only. Charges nothing itself: no dynamic fee, no return deltas. In-pool perps: before every swap that isn't the engine's own, the engine (once the timelock wires one) liquidates every position the swap would sink, at the price before it moves; a best-effort second sweep after. Reports the pool's fee to the engine (`perpFeeBps`). Not upgradeable. Owned by the Robinhood timelock. |
@@ -18,7 +18,8 @@ and the old IMDSTR claims the new coin 1:1, up to each holder's snapshot balance
 
 `launch(salt, expectedToken, sqrtPriceX96, minBought, excessTo)`, from the team wallet, with the ETH:
 
-1. creates IMD6900 with CREATE2 from the launch (reverts unless it lands at `expectedToken`, the mined 0x6900… address);
+1. creates IMD6900 with CREATE2 from the launch (reverts unless it lands at `expectedToken`, and unless that address starts
+   with 0x6900: `script/mine.sh` mines the salt for the deployed launch);
 2. opens the pool at `sqrtPriceX96` with all 1B as IMD6900-only liquidity from that price down: no ETH needed, locked;
 3. buys first with every wei the launch holds (nobody can trade before: the coin didn't exist a moment earlier);
 4. keeps the claims' reserve, and keeps the rest of what it bought in the launch: only the timelock moves it (`sellHeld`, `releaseExcess`, 12h public delay), so no wallet ever holds it.
@@ -30,7 +31,17 @@ the price from there (today: open at ~19.5 ETH market cap, buy ~2.77 of the 2.81
 (the locked position is the pool's only liquidity). Its ETH splits 90% to the pot bridge (it feeds IMD6900's NFT floor
 pot on Ethereum) and 10% to $IMD's canonical burn (bought on $IMD's Robinhood pool, sent to IMD's official burn
 executor `0x4D6537ec564aFf82eABb1Ce5f355E817cBEA1e07`, fixed in the code, which bridges it to Base); nothing to the
-team. The fee paid in IMD6900 (on sells) is burned: the pot bridge carries ETH only. The split is the Robinhood timelock's to change (`setPayees`, 12h public delay).
+team. The fee paid in IMD6900 (on sells) is burned: the pot bridge carries ETH only. The perps engine's fees (its open fee
+and liquidation penalties, after its stakers' 20% and insurance's 10%, both editable in the engine) come in through
+`addPerpFees()` and go on, all of it, as ETH to the pot bridge. Every landing address is the timelock's to change: the
+split's payees and shares (`setPayees`), the perps fees' (`setPerpFeeTo`), IMD's burn executor (`setImdBurn`, the
+canonical one by default), $IMD's pool (`setImdPool`).
+
+The road to the pot, end to end (each step anyone's to call; `script/launch.sh pot` does them all): `harvest()` here,
+`burnImd(min)` for the $IMD share, the pot bridge's `bridge()` (Robinhood → Across → Ethereum, from 0.05 ETH), then on
+Ethereum the pot hook's `depositBridgedFees()` (`0xA160…6444`), which adds it to the NFT pot: the strategy buys
+identity.md NFTs at the floor with it, and what it resells them for buys IMD6900 on Ethereum. Rehearsed on forks of
+both chains: 0.1 ETH bridged over Across, then 0.0995 into the pot. The split is the Robinhood timelock's to change (`setPayees`, 12h public delay).
 
 ## The fee, and routing
 
@@ -70,7 +81,7 @@ the opening buy's ETH or end the claims early: each visible 12h before it runs.
 ## Tests
 
 ```sh
-forge test                                         # 35 tests, offline: admission, launch, pool, fees, the fee's move, $IMD burn, claims, the ETH back
+forge test                                         # 39 tests, offline: admission, the 0x6900 coin, launch, pool, fees, the fee's move, $IMD burn, perps fees, claims, the ETH back
 ROBINHOOD_RPC_URL=https://rpc.mainnet.chain.robinhood.com forge test --match-contract RobinhoodFork -vv
 ```
 
@@ -93,5 +104,8 @@ team wallet's keystore (`imdstr-deployer`); `script/launch.sh status` shows wher
 6. Either `direct` (live on Uniswap in one transaction), or `programmable` (plan built from the exact source, packed with
    Programmable's packer, preflighted), `submit` (their manual review, up to 24h), `review`, then the team wallet signs
    `launch` in the approved 24h window, then the stamp.
+
+7. After it: `pot` whenever fees have piled up (harvest, $IMD burn, bridge, Ethereum deposit); `recover` /
+   `recover-exec` if the opening buy's ETH should come back.
 
 Rehearsed end to end, both ways, on forks of Robinhood (`SIGN_ARGS="--unlocked --from <team>" RPC=<fork>`).

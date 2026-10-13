@@ -13,7 +13,7 @@ import {TickMath} from "@uniswap/v4-core/src/libraries/TickMath.sol";
 import {FullMath} from "@uniswap/v4-core/src/libraries/FullMath.sol";
 import {IMD6900RobinhoodLaunch} from "../src/IMD6900RobinhoodLaunch.sol";
 import {IMD6900LockedPool} from "../src/IMD6900LockedPool.sol";
-import {HookSalt} from "./HookSalt.sol";
+import {HookSalt, CoinSalt} from "./HookSalt.sol";
 
 interface IERC20 {
     function balanceOf(address) external view returns (uint256);
@@ -105,10 +105,11 @@ contract RobinhoodForkTest is Test {
 
         // the launch: Ethereum's ~25 ETH market cap after a 2.81 ETH buy (4.44% of it the pool's fee)
         vm.deal(TEAM, 2.81 ether);
-        address expected = L.tokenAddress(bytes32(0));
+        bytes32 salt = CoinSalt.mine(L); // 0x6900, as script/mine.sh finds it
+        address expected = L.tokenAddress(salt);
         uint160 sp = uint160(_sqrt(FullMath.mulDiv(SUPPLY, 1 << 192, 19.40 ether)));
         vm.prank(TEAM);
-        (address t, uint256 bought) = L.launch{value: 2.81 ether}(bytes32(0), expected, sp, 0, address(L)); // as launch.sh: the excess kept
+        (address t, uint256 bought) = L.launch{value: 2.81 ether}(salt, expected, sp, 0, address(L)); // as launch.sh: the excess kept
         emit log_named_decimal_uint("opening buy, coins", bought, 18);
         IMD6900LockedPool pool = L.pool();
         uint128 locked = pool.liquidity();

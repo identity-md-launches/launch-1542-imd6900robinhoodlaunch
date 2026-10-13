@@ -20,3 +20,16 @@ library HookSalt {
         }
     }
 }
+
+/// @dev What script/mine.sh mines with cast, for the tests: the first salt whose CREATE2 address for the coin starts
+///      with the launch's VANITY (0x6900)
+library CoinSalt {
+    function mine(IMD6900RobinhoodLaunch l) internal view returns (bytes32 s) {
+        bytes32 initHash = l.tokenInitCodeHash();
+        uint160 vanity = l.VANITY();
+        for (uint256 i;; ++i) {
+            address a = address(uint160(uint256(keccak256(abi.encodePacked(bytes1(0xff), address(l), i, initHash)))));
+            if (uint160(a) >> 144 == vanity) return bytes32(i);
+        }
+    }
+}
